@@ -80,6 +80,7 @@ def get_macro_events(start_date: datetime.date, end_date: datetime.date) -> List
     macro_list = []
     curr = start_date
     while curr <= end_date:
+        # 每月第一個星期五：非農就業報告 (NFP)
         if curr.weekday() == 4 and 1 <= curr.day <= 7:
             macro_list.append({
                 "date": curr.strftime("%Y-%m-%d"),
@@ -89,6 +90,7 @@ def get_macro_events(start_date: datetime.date, end_date: datetime.date) -> List
                 "tag_color": "bg-amber-950 text-amber-300 border-amber-800",
                 "impact": "影響聯準會降息預期與大盤整體波動"
             })
+        # 每月 12 號左右的非週末：CPI 消費者物價指數
         if curr.day == 12 and curr.weekday() < 5:
             macro_list.append({
                 "date": curr.strftime("%Y-%m-%d"),
@@ -98,6 +100,7 @@ def get_macro_events(start_date: datetime.date, end_date: datetime.date) -> List
                 "tag_color": "bg-rose-950 text-rose-300 border-rose-800",
                 "impact": "關鍵通膨指標，常引發美股大盤單日劇烈震盪"
             })
+        # 每月下旬 26 號左右：核心 PCE 物價指數
         if curr.day == 26 and curr.weekday() < 5:
             macro_list.append({
                 "date": curr.strftime("%Y-%m-%d"),
@@ -118,6 +121,7 @@ def fetch_stock_events(symbol: str) -> List[Dict[str, Any]]:
     
     events = []
     
+    # 1. 爬取個股專屬業績日曆 (針對美股個股；若為 ETF 或不支援的港股則靜默跳過)
     try:
         stock = yf.Ticker(symbol, session=YF_SESSION)
         cal = None
@@ -158,8 +162,11 @@ def fetch_stock_events(symbol: str) -> List[Dict[str, Any]]:
     except Exception:
         pass
 
+    # 2. 加入總體經濟重大日曆 (特別對 VOO / 港股等指數與大盤 ETF 極為重要)
     macro_events = get_macro_events(now_tz, end_date)
     events.extend(macro_events)
+    
+    # 3. 按日期與倒數天數排序
     events.sort(key=lambda x: x["days_left"])
     return events[:5]
 
@@ -473,25 +480,14 @@ def calculate_rigorous_score(df: pd.DataFrame):
     return score, reasons, advice, shock_data
 
 # ----------------------------------------------------------------------
-# 13 大 AI 機器學習預估引擎 (包含微調 1：邊界約束與極值特徵平滑)
+# 13 大 AI 機器學習預估引擎
 # ----------------------------------------------------------------------
 def predict_prices_with_13_models(df: pd.DataFrame):
-    """
-    【微調 1】：13 大 AI 模型擬合平滑化與波動界限微調
-    - 增加目標收益率邊界約束 (Target Return Clipping)，防範異常極端值引發預測失常
-    - 引入魯棒性特徵縮放，優化強噪聲行情下各模型 O/H/L 獨立擬合精度
-    """
     try:
         data = df.copy()
-        
-        # 微調 1 亮點：計算波動率收益率並實施 ±12% 邊界平滑裁減 (Clipping) 防範離群值
-        raw_open_ret = (data['Open'].shift(-1) - data['Close']) / data['Close']
-        raw_high_ret = (data['High'].shift(-1) - data['Close']) / data['Close']
-        raw_low_ret = (data['Low'].shift(-1) - data['Close']) / data['Close']
-
-        data['Target_Open_Ret'] = np.clip(raw_open_ret, -0.12, 0.12)
-        data['Target_High_Ret'] = np.clip(raw_high_ret, -0.12, 0.15)
-        data['Target_Low_Ret'] = np.clip(raw_low_ret, -0.15, 0.12)
+        data['Target_Open_Ret'] = (data['Open'].shift(-1) - data['Close']) / data['Close']
+        data['Target_High_Ret'] = (data['High'].shift(-1) - data['Close']) / data['Close']
+        data['Target_Low_Ret'] = (data['Low'].shift(-1) - data['Close']) / data['Close']
 
         features = ['RSI', 'K', 'D', 'Close_MA20_Ratio', 'BB_Width', 'MACD_Hist', 'Vol_Ratio', 'ADX']
         train_data = data.dropna(subset=['Target_Open_Ret', 'Target_High_Ret', 'Target_Low_Ret'] + features)
@@ -536,9 +532,8 @@ def predict_prices_with_13_models(df: pd.DataFrame):
                 model.fit(X_scaled, train_data['Target_Low_Ret'])
                 pl = curr_close * (1 + float(model.predict(latest_X)[0]))
 
-                # 微調 1：邏輯邊界物理硬性校正 (High >= max(Open, Close), Low <= min(Open, Close))
-                ph = max(ph, po, curr_close * 1.0005)
-                pl = min(pl, po, curr_close * 0.9995)
+                ph = max(ph, po, curr_close * 1.001)
+                pl = min(pl, po, curr_close * 0.999)
 
                 open_details[name] = round(po, 2)
                 high_details[name] = round(ph, 2)
@@ -552,11 +547,6 @@ def predict_prices_with_13_models(df: pd.DataFrame):
         avg_open = round(float(np.mean(list(open_details.values()))), 2)
         avg_high = round(float(np.mean(list(high_details.values()))), 2)
         avg_low = round(float(np.mean(list(low_details.values()))), 2)
-        
-        # 再次保證整體加權平均邏輯不違背價格形態
-        avg_high = max(avg_high, avg_open, curr_close)
-        avg_low = min(avg_low, avg_open, curr_close)
-        
         open_pct = round(((avg_open - curr_close) / curr_close) * 100, 1)
 
         model_list = []
@@ -581,14 +571,9 @@ def predict_prices_with_13_models(df: pd.DataFrame):
         return None
 
 # ----------------------------------------------------------------------
-# 審計對比算法 (包含微調 2：盤中實時動態開盤與完全結算精準校準)
+# 審計對比算法 (自動去重並確保歷程簡潔)
 # ----------------------------------------------------------------------
 def update_pred_audit(symbol: str, df: pd.DataFrame, session: str, pred_res: dict):
-    """
-    【微調 2】：審計結算對比與歷史數據去重邏輯微調
-    - 優化跨日交易時間點判斷機制，自動修正「待結算」、「開盤結算」與「完全結算」狀態轉移
-    - 精準匹配最新 K 線時間戳記，確保歷程簡潔且數據精確不重複
-    """
     symbol = symbol.strip().upper()
     raw_audit = GLOBAL_STATE.get("pred_audit", {}).get(symbol, [])
     tz_str = "Asia/Hong_Kong" if symbol.endswith(".HK") else "America/New_York"
@@ -604,7 +589,6 @@ def update_pred_audit(symbol: str, df: pd.DataFrame, session: str, pred_res: dic
     base_date_str = df.index[-1].strftime("%Y-%m-%d")
     current_time_num = now_tz.hour * 100 + now_tz.minute
 
-    # 1. 寫入或更新當日 (Base Date) 預測數據
     if pred_res is not None:
         if base_date_str in audit_dict:
             if not audit_dict[base_date_str].get("full_verified"):
@@ -627,7 +611,6 @@ def update_pred_audit(symbol: str, df: pd.DataFrame, session: str, pred_res: dic
     audit_list = [audit_dict[d] for d in sorted_dates]
     df_date_strs = list(df.index.strftime("%Y-%m-%d"))
 
-    # 2. 微調 2：動態匹配歷史實際走勢並進行二階段對比 (開盤對比 / 全日 High-Low 對比)
     for item in audit_list:
         b_date = item["base_date"]
         
@@ -641,7 +624,6 @@ def update_pred_audit(symbol: str, df: pd.DataFrame, session: str, pred_res: dic
             target_row = df[df.index.strftime("%Y-%m-%d") == target_date_str].iloc[0]
             is_today = (target_date_str == base_date_str)
 
-            # 微調 2：微秒級港股/美股精準收盤時間線驗證
             if is_today:
                 if symbol.endswith(".HK"):
                     is_truly_closed = (current_time_num >= 1610) or (session == "CLOSED")
@@ -650,7 +632,6 @@ def update_pred_audit(symbol: str, df: pd.DataFrame, session: str, pred_res: dic
             else:
                 is_truly_closed = True
 
-            # 階段一：開盤價對比校驗
             act_open = round(float(target_row['Open']), 2)
             if act_open > 0 and not item.get("open_verified"):
                 item["actual_open"] = act_open
@@ -658,7 +639,6 @@ def update_pred_audit(symbol: str, df: pd.DataFrame, session: str, pred_res: dic
                 item["open_verified"] = True
                 item["status"] = "開盤結算"
 
-            # 階段二：收盤完全結算校驗 (High/Low)
             if is_truly_closed and not item.get("full_verified"):
                 act_high = round(float(target_row['High']), 2)
                 act_low = round(float(target_row['Low']), 2)
@@ -670,7 +650,6 @@ def update_pred_audit(symbol: str, df: pd.DataFrame, session: str, pred_res: dic
                     item["full_verified"] = True
                     item["status"] = "完全結算"
 
-    # 3. 去重並保留近 10 筆清晰歷程
     final_list = []
     seen_targets = set()
     
@@ -717,13 +696,11 @@ def process_single_stock(symbol: str):
     atr = float(latest['ATR'])
 
     score, reasons, advice, shock_data = calculate_rigorous_score(df)
-    
-    # 執行微調 1 & 微調 2 核心預測與審計對比
     pred_res = predict_prices_with_13_models(df)
     history_logs = update_pred_audit(symbol, df, session, pred_res)
-    
     pos_str, stop_loss, take_profit, trailing_stop = calculate_dynamic_risk(curr_price, atr)
     
+    # 自動爬取近 30 天重點事件與業績日曆
     upcoming_events = fetch_stock_events(symbol)
 
     session_map = {
@@ -900,7 +877,7 @@ def index():
                     全自動即時連線中
                 </span>
             </div>
-            <p class="text-xs text-gray-400 mt-1">13 大 AI 機器學習模型全自動持續更新 + 未來 30 天重大事件/業績自動追蹤 (含微調 1 & 微調 2 加強版)</p>
+            <p class="text-xs text-gray-400 mt-1">13 大 AI 機器學習模型全自動持續更新 + 未來 30 天重大事件/業績自動追蹤</p>
         </div>
         <div class="flex items-center gap-2">
             <input type="text" id="stockInput" placeholder="輸入代碼 (例: 3466.HK, NVDA)" 
