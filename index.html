@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh-TW" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stock Alert Live Console (Telegram Style)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .chat-scroll::-webkit-scrollbar { width: 6px; }
+        .chat-scroll::-webkit-scrollbar-track { background: #0f172a; }
+        .chat-scroll::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+    </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen font-sans">
+
+    <!-- 頂部導覽列 -->
+    <header class="bg-slate-900/90 border-b border-slate-800 p-4 sticky top-0 z-50 backdrop-blur flex justify-between items-center">
+        <div class="flex items-center space-x-3">
+            <span class="text-2xl">📡</span>
+            <div>
+                <h1 class="text-lg font-extrabold bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent">
+                    股票即時監控 & Telegram 動態頻道
+                </h1>
+                <p class="text-[11px] text-slate-400">13 ML模型預測 x 實時條件警訊推播</p>
+            </div>
+        </div>
+        <div class="flex items-center gap-2">
+            <span class="relative flex h-3 w-3">
+              <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+              <span class="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
+            </span>
+            <span class="text-xs text-slate-300 font-semibold">Live 輪詢中</span>
+        </div>
+    </header>
+
+    <main class="p-4 max-w-[1400px] mx-auto space-y-4">
+        
+        <!-- 股票管理與追蹤列 -->
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-wrap items-center justify-between gap-4 shadow-lg">
+            <div class="flex items-center gap-2">
+                <span class="text-lg">🎯</span>
+                <h2 class="font-bold text-slate-200">追蹤股票清單</h2>
+            </div>
+            
+            <div class="flex items-center gap-2 w-full sm:w-auto">
+                <input type="text" id="stock-input" placeholder="輸入代碼 (例: AAPL, 2330.TW)" 
+                       onkeypress="if(event.key === 'Enter') addStock()"
+                       class="bg-slate-950 border border-slate-700 text-slate-100 text-sm rounded-lg px-3 py-2 focus:outline-none focus:border-cyan-500 uppercase flex-1 sm:w-60">
+                <button onclick="addStock()" 
+                        class="bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-600 hover:to-blue-700 text-white font-bold text-sm px-4 py-2 rounded-lg transition shadow">
+                    + 追蹤
+                </button>
+            </div>
+        </div>
+
+        <!-- 追蹤標的即時價格卡片 -->
+        <div id="ticker-bar" class="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 gap-3">
+            <!-- JavaScript 動態填入 -->
+        </div>
+
+        <!-- 主頻道區域 (Telegram 訊息串視窗) -->
+        <section class="bg-slate-900 border border-slate-800 rounded-xl flex flex-col h-[700px] shadow-2xl">
+            <!-- 頻道頂部工具欄 -->
+            <div class="p-3 border-b border-slate-800 flex justify-between items-center bg-slate-900/90 rounded-t-xl">
+                <div class="flex items-center gap-2">
+                    <span class="text-xl">📢</span>
+                    <span class="font-bold text-slate-200"> Telegram 訊息推播頻道</span>
+                </div>
+                <!-- 篩選按鈕區 -->
+                <div class="flex items-center gap-1.5 text-xs">
+                    <button onclick="filterFeed('ALL')" id="filter-ALL" class="px-2.5 py-1 rounded bg-cyan-600 text-white font-bold">全部</button>
+                    <button onclick="filterFeed('ALERT')" id="filter-ALERT" class="px-2.5 py-1 rounded bg-slate-800 text-slate-400 hover:bg-slate-700">🚨 警訊</button>
+                    <button onclick="filterFeed('ML')" id="filter-ML" class="px-2.5 py-1 rounded bg-slate-800 text-slate-400 hover:bg-slate-700">🤖 13-ML預測</button>
+                </div>
+            </div>
+
+            <!-- Telegram 風格對話框滾動區 -->
+            <div id="chat-feed" class="flex-1 p-4 overflow-y-auto space-y-3 chat-scroll bg-slate-950/70">
+                <!-- Telegram 訊息卡片 -->
+            </div>
+        </section>
+
+    </main>
+
+    <script>
+        let currentFilter = 'ALL';
+        let rawFeedData = [];
+
+        // 渲染 Telegram 訊息卡片
+        function renderFeed() {
+            const chatBox = document.getElementById('chat-feed');
+            
+            const filteredFeed = rawFeedData.filter(msg => {
+                if (currentFilter === 'ALL') return true;
+                return msg.type === currentFilter;
+            });
+
+            if (filteredFeed.length === 0) {
+                chatBox.innerHTML = `<div class="text-center text-slate-500 py-10 text-sm">無相關訊息紀錄...</div>`;
+                return;
+            }
+
+            chatBox.innerHTML = filteredFeed.map(msg => {
+                let badgeStyle = "bg-slate-800 text-slate-300 border-slate-700";
+                let borderStyle = "border-slate-800 bg-slate-900/80";
+                
+                if (msg.level === "danger") {
+                    badgeStyle = "bg-red-950 text-red-400 border-red-800 animate-pulse";
+                    borderStyle = "border-red-900/50 bg-red-950/20";
+                } else if (msg.level === "warning") {
+                    badgeStyle = "bg-amber-950 text-amber-400 border-amber-800";
+                    borderStyle = "border-amber-900/50 bg-amber-950/20";
+                } else if (msg.level === "success") {
+                    badgeStyle = "bg-emerald-950 text-emerald-400 border-emerald-800";
+                    borderStyle = "border-emerald-900/50 bg-emerald-950/20";
+                } else if (msg.level === "cyan") {
+                    badgeStyle = "bg-cyan-950 text-cyan-300 border-cyan-800";
+                    borderStyle = "border-cyan-900/50 bg-cyan-950/20";
+                }
+
+                // 替換內文換行符號為 <br>
+                const formattedContent = msg.content.replace(/\n/g, '<br>');
+
+                return `
+                    <div class="p-3.5 rounded-xl border ${borderStyle} shadow-md space-y-1.5 transition">
+                        <div class="flex justify-between items-center">
+                            <span class="text-[10px] font-extrabold px-2 py-0.5 rounded border ${badgeStyle}">
+                                [${msg.type}] ${msg.symbol}
+                            </span>
+                            <span class="text-[10px] text-slate-500 font-mono">${msg.timestamp}</span>
+                        </div>
+                        <div class="text-sm font-bold text-slate-100">${msg.title}</div>
+                        <div class="text-xs text-slate-300 leading-relaxed font-sans">${formattedContent}</div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function filterFeed(type) {
+            currentFilter = type;
+            ['ALL', 'ALERT', 'ML'].forEach(t => {
+                const btn = document.getElementById(`filter-${t}`);
+                if (t === type) {
+                    btn.className = "px-2.5 py-1 rounded bg-cyan-600 text-white font-bold";
+                } else {
+                    btn.className = "px-2.5 py-1 rounded bg-slate-800 text-slate-400 hover:bg-slate-700";
+                }
+            });
+            renderFeed();
+        }
+
+        async function addStock() {
+            const input = document.getElementById('stock-input');
+            const symbol = input.value.trim().toUpperCase();
+            if (!symbol) return;
+
+            try {
+                await fetch('/api/stocks', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ symbol })
+                });
+                input.value = '';
+                fetchState();
+            } catch (err) {
+                alert("新增標的失敗");
+            }
+        }
+
+        async function removeStock(symbol) {
+            if (!confirm(`確定移除 ${symbol}？`)) return;
+            try {
+                await fetch(`/api/stocks/${symbol}`, { method: 'DELETE' });
+                fetchState();
+            } catch (err) {
+                alert("刪除標的失敗");
+            }
+        }
+
+        async function triggerML(symbol) {
+            try {
+                await fetch(`/api/predict/${symbol}`, { method: 'POST' });
+                alert(`已送出 ${symbol} 的 13-ML 模型預測請求，結果隨後顯示於頻道中！`);
+            } catch (err) {
+                alert("觸發預測失敗");
+            }
+        }
+
+        async function fetchState() {
+            try {
+                const res = await fetch('/api/state');
+                const data = await res.json();
+
+                // 1. 渲染追蹤標的即時價格卡片 (含手動觸發 ML 按鈕與刪除按鈕)
+                const tickerBar = document.getElementById('ticker-bar');
+                if (data.prices) {
+                    tickerBar.innerHTML = Object.entries(data.prices).map(([symbol, price]) => `
+                        <div class="relative p-3 rounded-xl border bg-slate-900 border-slate-800 text-center group hover:border-slate-700 transition">
+                            <button onclick="removeStock('${symbol}')" 
+                                    class="absolute top-1 right-2 text-slate-500 hover:text-red-400 font-bold text-xs p-1" 
+                                    title="移除追蹤">✕</button>
+                            <div class="text-xs text-slate-400 font-bold">${symbol}</div>
+                            <div class="text-base font-bold text-emerald-400 my-0.5">$${price ? price.toFixed(2) : '---'}</div>
+                            <button onclick="triggerML('${symbol}')" 
+                                    class="text-[10px] bg-slate-800 hover:bg-cyan-950 text-cyan-400 hover:text-cyan-300 border border-slate-700 px-2 py-0.5 rounded transition">
+                                🤖 執行 ML 預測
+                            </button>
+                        </div>
+                    `).join('');
+                }
+
+                // 2. 更新頻道動態數據
+                if (data.feed) {
+                    rawFeedData = data.feed;
+                    renderFeed();
+                }
+
+            } catch (err) {
+                console.error("更新異常:", err);
+            }
+        }
+
+        fetchState();
+        setInterval(fetchState, 4000); // 每 4 秒自動刷一輪頻道最新動態
+    </script>
+</body>
+</html>
