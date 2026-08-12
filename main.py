@@ -180,7 +180,8 @@ def get_stock_session(symbol: str) -> str:
         if now_hk.weekday() >= 5:
             return "CLOSED"
         time_num = now_hk.hour * 100 + now_hk.minute
-        if time_num < 930:
+        # 港股開市前競價時段為 09:00 - 09:30，其餘非交易時段（含凌晨及 16:10 後）均為已收盤
+        if 900 <= time_num < 930:
             return "PRE"
         elif 930 <= time_num < 1200:
             return "REGULAR"
