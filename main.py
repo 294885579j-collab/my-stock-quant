@@ -10,6 +10,7 @@ from typing import Dict, Any, List
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from scipy.stats import norm
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import (
@@ -39,6 +40,9 @@ YF_SESSION.headers.update({
 })
 
 app = FastAPI(title="AI Quant Trading Platform")
+
+# 期權狀態快取 (避免頻繁請求 API 導致 Rate Limit)
+OPTIONS_CACHE = {}
 
 # ----------------------------------------------------------------------
 # 狀態載入與儲存
@@ -73,14 +77,12 @@ def save_state(state: Dict[str, Any]):
 GLOBAL_STATE = load_state()
 
 # ----------------------------------------------------------------------
-# 未來 30 天重大事件與季度業績爬取模組（修復 ETF / 港股 404 報錯）
+# 未來 30 天重大事件與季度業績爬取模組
 # ----------------------------------------------------------------------
 def get_macro_events(start_date: datetime.date, end_date: datetime.date) -> List[Dict[str, Any]]:
-    """動態計算近 30 天重點總體經濟日曆 (CPI, FOMC, PCE, NFP)"""
     macro_list = []
     curr = start_date
     while curr <= end_date:
-        # 每月第一個星期五：非農就業報告 (NFP)
         if curr.weekday() == 4 and 1 <= curr.day <= 7:
             macro_list.append({
                 "date": curr.strftime("%Y-%m-%d"),
@@ -90,7 +92,6 @@ def get_macro_events(start_date: datetime.date, end_date: datetime.date) -> List
                 "tag_color": "bg-amber-950 text-amber-300 border-amber-800",
                 "impact": "影響聯準會降息預期與大盤整體波動"
             })
-        # 每月 12 號左右的非週末：CPI 消費者物價指數
         if curr.day == 12 and curr.weekday() < 5:
             macro_list.append({
                 "date": curr.strftime("%Y-%m-%d"),
@@ -100,7 +101,6 @@ def get_macro_events(start_date: datetime.date, end_date: datetime.date) -> List
                 "tag_color": "bg-rose-950 text-rose-300 border-rose-800",
                 "impact": "關鍵通膨指標，常引發美股大盤單日劇烈震盪"
             })
-        # 每月下旬 26 號左右：核心 PCE 物價指數
         if curr.day == 26 and curr.weekday() < 5:
             macro_list.append({
                 "date": curr.strftime("%Y-%m-%d"),
@@ -110,18 +110,52 @@ def get_macro_events(start_date: datetime.date, end_date: datetime.date) -> List
                 "tag_color": "bg-purple-950 text-purple-300 border-purple-800",
                 "impact": "聯準會最看重的通膨指標"
             })
+        if curr.month == 11 and curr.weekday() == 1 and 2 <= curr.day <= 8:
+            if curr.year % 4 == 0:
+                macro_list.append({
+                    "date": curr.strftime("%Y-%m-%d"),
+                    "days_left": (curr - start_date).days,
+                    "title": "🏛️ 美國總統大選 (Presidential Election Day)",
+                    "tag": "🗳️ 總統大選",
+                    "tag_color": "bg-red-950 text-red-300 border-red-800 font-bold animate-pulse",
+                    "impact": "決定未來四年產業與稅務政策，選前極致觀望、選後慶祝行情高爆發"
+                })
+            elif curr.year % 4 == 2:
+                macro_list.append({
+                    "date": curr.strftime("%Y-%m-%d"),
+                    "days_left": (curr - start_date).days,
+                    "title": "🏛️ 美國中期選舉 (Midterm Election Day)",
+                    "tag": "🗳️ 中期選舉",
+                    "tag_color": "bg-amber-950 text-amber-300 border-amber-800 font-bold animate-pulse",
+                    "impact": "決定國會兩黨席次，政策不確定性消除後歷史上股市上漲機率極高"
+                })
+        if curr.month in [3, 6, 9, 12] and curr.weekday() == 4 and 15 <= curr.day <= 21:
+            macro_list.append({
+                "date": curr.strftime("%Y-%m-%d"),
+                "days_left": (curr - start_date).days,
+                "title": "🧙‍♀️ 四巫日期權/期貨大結算 (Quadruple Witching)",
+                "tag": "🔮 期權結算",
+                "tag_color": "bg-indigo-950 text-indigo-300 border-indigo-800 font-bold",
+                "impact": "指數/股票期權期貨集中到期，尾盤易出現極致暴量洗盤與高波動"
+            })
+        if curr.weekday() == 2 and 18 <= curr.day <= 24 and curr.month in [1, 3, 5, 6, 7, 9, 11, 12]:
+            macro_list.append({
+                "date": curr.strftime("%Y-%m-%d"),
+                "days_left": (curr - start_date).days,
+                "title": "🏦 FOMC 聯準會利率決議 & 鮑爾記者會",
+                "tag": "🎯 FED決議",
+                "tag_color": "bg-cyan-950 text-cyan-300 border-cyan-800 font-bold animate-pulse",
+                "impact": "決定升降息與點陣圖走向，全球資本市場最核心的資金流向風向球"
+            })
         curr += timedelta(days=1)
     return macro_list
 
 def fetch_stock_events(symbol: str) -> List[Dict[str, Any]]:
-    """自動搜尋個股季度業績與結合總經日曆（靜默處理不支援業績日的 ETF/港股）"""
     symbol = symbol.strip().upper()
     now_tz = datetime.now(ZoneInfo("Asia/Hong_Kong")).date()
     end_date = now_tz + timedelta(days=30)
     
     events = []
-    
-    # 1. 爬取個股專屬業績日曆 (針對美股個股；若為 ETF 或不支援的港股則靜默跳過)
     try:
         stock = yf.Ticker(symbol, session=YF_SESSION)
         cal = None
@@ -162,13 +196,218 @@ def fetch_stock_events(symbol: str) -> List[Dict[str, Any]]:
     except Exception:
         pass
 
-    # 2. 加入總體經濟重大日曆 (特別對 VOO / 港股等指數與大盤 ETF 極為重要)
     macro_events = get_macro_events(now_tz, end_date)
     events.extend(macro_events)
-    
-    # 3. 按日期與倒數天數排序
     events.sort(key=lambda x: x["days_left"])
     return events[:5]
+
+# ----------------------------------------------------------------------
+# 高階期權風險量化引擎 (Black-Scholes-Merton + Greeks + Risk Metrics)
+# ----------------------------------------------------------------------
+def bs_greeks_and_price(S: float, K: float, T: float, r: float, sigma: float, option_type: str = "call") -> dict:
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return {"price": 0.0, "delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "rho": 0.0, "pop": 0.0, "d1": 0.0, "d2": 0.0}
+    
+    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    pdf_d1 = norm.pdf(d1)
+    
+    if option_type == "call":
+        price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+        delta = norm.cdf(d1)
+        pop = norm.cdf(d2) 
+        theta = (- (S * pdf_d1 * sigma) / (2 * np.sqrt(T)) - r * K * np.exp(-r * T) * norm.cdf(d2)) / 365.0
+        rho = (K * T * np.exp(-r * T) * norm.cdf(d2)) / 100.0
+    else:
+        price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+        delta = norm.cdf(d1) - 1.0
+        pop = norm.cdf(-d2) 
+        theta = (- (S * pdf_d1 * sigma) / (2 * np.sqrt(T)) + r * K * np.exp(-r * T) * norm.cdf(-d2)) / 365.0
+        rho = (- K * T * np.exp(-r * T) * norm.cdf(-d2)) / 100.0
+        
+    gamma = pdf_d1 / (S * sigma * np.sqrt(T))
+    vega = (S * pdf_d1 * np.sqrt(T)) / 100.0
+    
+    return {
+        "price": float(price),
+        "delta": float(delta),
+        "gamma": float(gamma),
+        "theta": float(theta),
+        "vega": float(vega),
+        "rho": float(rho),
+        "pop": float(pop),
+        "d1": float(d1),
+        "d2": float(d2)
+    }
+
+def calculate_options_recommendation(symbol: str, df: pd.DataFrame, score: int, shock_data: dict, events: list) -> dict:
+    """ 重構優化：量化期權風險與策略算式引擎 """
+    
+    # 檢查股票是否支援期權 (並快取結果避免重複請求)
+    if symbol not in OPTIONS_CACHE:
+        try:
+            stock = yf.Ticker(symbol, session=YF_SESSION)
+            OPTIONS_CACHE[symbol] = bool(stock.options and len(stock.options) > 0)
+        except Exception:
+            OPTIONS_CACHE[symbol] = False
+
+    if not OPTIONS_CACHE[symbol]:
+        return {
+            "strategy": "🚫 不能購買 (無期權市場)",
+            "action": "NONE",
+            "reason": f"系統檢測到 {symbol} 目前不支援期權交易或無可用的期權合約。",
+            "strike_price": "N/A",
+            "exp_date": "N/A",
+            "take_profit_target": "N/A",
+            "greeks": {},
+            "risk_metrics": {},
+            "stress_test": []
+        }
+
+    if len(df) < 30:
+        return {
+            "strategy": "🚫 數據不足",
+            "action": "NONE",
+            "reason": "歷史數據少於 30 日，無法精確計算 30D 年化波動率與 Greeks。",
+            "strike_price": "N/A",
+            "exp_date": "N/A",
+            "take_profit_target": "N/A",
+            "greeks": {},
+            "risk_metrics": {},
+            "stress_test": []
+        }
+
+    latest = df.iloc[-1]
+    close_price = float(latest['Close'])
+    atr = float(latest['ATR'])
+    bb_lower = float(latest['BB_Lower'])
+    bb_upper = float(latest['BB_Upper'])
+
+    log_returns = np.log(df['Close'] / df['Close'].shift(1)).dropna()
+    hv_30d = float(log_returns.tail(30).std() * np.sqrt(252))
+    if pd.isna(hv_30d) or hv_30d <= 0:
+        hv_30d = 0.30
+
+    tz_str = "Asia/Hong_Kong" if symbol.endswith(".HK") else "America/New_York"
+    now_date = datetime.now(ZoneInfo(tz_str)).date()
+    target_dt = now_date + timedelta(days=35)
+    days_to_friday = (4 - target_dt.weekday()) % 7
+    exp_dt = target_dt + timedelta(days=days_to_friday)
+    exp_date = exp_dt.strftime("%Y-%m-%d")
+    
+    days_to_exp = max(1, (exp_dt - now_date).days)
+    T = days_to_exp / 365.0
+    r = 0.045
+
+    has_near_earnings = any(e.get("days_left", 99) <= 7 and "業績" in e.get("title", "") for e in events)
+    is_high_volatile = shock_data.get("is_high_volatile", False)
+
+    if has_near_earnings or is_high_volatile or score < 45:
+        return {
+            "strategy": "🚫 暫不建議期權操作",
+            "action": "NONE",
+            "reason": "近 7 天有重大業績發佈、股價極致震盪或技術打分偏弱，波動率溢價 (IV Crush Risk) 過高或方向極不明確。",
+            "strike_price": "N/A",
+            "exp_date": "N/A",
+            "take_profit_target": "N/A",
+            "greeks": {
+                "hv_30d": f"{hv_30d*100:.1f}%",
+                "dte": f"{days_to_exp} 天"
+            },
+            "risk_metrics": {},
+            "stress_test": []
+        }
+    elif score >= 70:
+        strike = round(close_price + (1.0 * atr), 2)
+        pct_otm = round((strike / close_price - 1) * 100, 1)
+        
+        bs_res = bs_greeks_and_price(close_price, strike, T, r, hv_30d, "call")
+        call_price = bs_res["price"]
+        
+        var_95_stock = 1.645 * hv_30d * np.sqrt(T) * close_price
+        pop_pct = round(bs_res["pop"] * 100, 1)
+        
+        stress_test = []
+        for change_pct in [-10, -5, 0, 5, 10]:
+            sim_s = close_price * (1 + change_pct / 100.0)
+            sim_res = bs_greeks_and_price(sim_s, strike, T, r, hv_30d, "call")
+            sim_pnl = ((sim_res["price"] - call_price) / (call_price + 1e-9)) * 100
+            stress_test.append({
+                "price_change": f"{change_pct:+d}%",
+                "target_price": round(sim_s, 2),
+                "opt_price": round(sim_res["price"], 2),
+                "pnl_pct": f"{sim_pnl:+.1f}%"
+            })
+
+        return {
+            "strategy": "🐂 建議 Buy Call (買看漲期權)",
+            "action": "BUY_CALL",
+            "reason": f"技術面得分為強勢多頭區間 ({score}分)，採用 Buy Call 槓桿參與上漲行情。",
+            "strike_price": f"${strike} (OTM +{pct_otm}%)",
+            "exp_date": f"{exp_date} ({days_to_exp} 天 DTE)",
+            "take_profit_target": "權利金獲利 +50% ~ +100% 或正股觸及布林上軌時提前平倉",
+            "greeks": {
+                "hv_30d": f"{hv_30d*100:.1f}%",
+                "est_premium": f"${call_price:.2f}",
+                "delta": f"{bs_res['delta']:.3f}",
+                "gamma": f"{bs_res['gamma']:.4f}",
+                "theta": f"${bs_res['theta']:.3f}/日",
+                "vega": f"${bs_res['vega']:.3f}/1% IV"
+            },
+            "risk_metrics": {
+                "pop": f"{pop_pct}% (到期價內勝率)",
+                "max_loss": f"${call_price:.2f} / 股 (${call_price*100:.0f} / 張)",
+                "var_95": f"${var_95_stock:.2f} (正股 95% 波動風險值)",
+                "risk_reward": f"1 : {(atr*2)/max(call_price, 0.01):.1f} (理論盈虧比)"
+            },
+            "stress_test": stress_test
+        }
+    else:
+        strike = round(min(close_price - (1.5 * atr), bb_lower), 2)
+        pct_otm = round((1 - strike / close_price) * 100, 1)
+        
+        bs_res = bs_greeks_and_price(close_price, strike, T, r, hv_30d, "put")
+        put_price = bs_res["price"]
+        
+        pop_pct = round((1.0 - norm.cdf(bs_res["d2"])) * 100, 1)
+        var_95_stock = 1.645 * hv_30d * np.sqrt(T) * close_price
+        
+        stress_test = []
+        for change_pct in [-10, -5, 0, 5, 10]:
+            sim_s = close_price * (1 + change_pct / 100.0)
+            sim_res = bs_greeks_and_price(sim_s, strike, T, r, hv_30d, "put")
+            sim_pnl_dollar = put_price - sim_res["price"]
+            sim_pnl_pct = (sim_pnl_dollar / (put_price + 1e-9)) * 100
+            stress_test.append({
+                "price_change": f"{change_pct:+d}%",
+                "target_price": round(sim_s, 2),
+                "opt_price": round(sim_res["price"], 2),
+                "pnl_pct": f"{sim_pnl_pct:+.1f}%"
+            })
+
+        return {
+            "strategy": "🛡️ 建議 Sell Put (賣看跌期權/收取權利金)",
+            "action": "SELL_PUT",
+            "reason": f"技術面處於中性盤整區間 ({score}分)，適合透過 Sell Put 賺取時間價值衰減 (Theta decay)。",
+            "strike_price": f"${strike} (OTM -{pct_otm}%)",
+            "exp_date": f"{exp_date} ({days_to_exp} 天 DTE)",
+            "take_profit_target": "當獲得最大權利金收益之 50% ~ 75% 時提前買回平倉 (Buy to Close)",
+            "greeks": {
+                "hv_30d": f"{hv_30d*100:.1f}%",
+                "est_premium": f"${put_price:.2f}",
+                "delta": f"{bs_res['delta']:.3f}",
+                "gamma": f"{bs_res['gamma']:.4f}",
+                "theta": f"${abs(bs_res['theta']):.3f}/日 (收益)",
+                "vega": f"${bs_res['vega']:.3f}/1% IV"
+            },
+            "risk_metrics": {
+                "pop": f"{pop_pct}% (到期不履約/獲利勝率)",
+                "max_gain": f"${put_price:.2f} / 股 (${put_price*100:.0f} / 張)",
+                "var_95": f"${var_95_stock:.2f} (正股 95% 波動風險值)",
+                "breakeven": f"${strike - put_price:.2f} (損益平衡點)"
+            },
+            "stress_test": stress_test
+        }
 
 # ----------------------------------------------------------------------
 # 市場狀態與即時股價獲取
@@ -180,7 +419,6 @@ def get_stock_session(symbol: str) -> str:
         if now_hk.weekday() >= 5:
             return "CLOSED"
         time_num = now_hk.hour * 100 + now_hk.minute
-        # 港股開市前競價時段為 09:00 - 09:30，其餘非交易時段（含凌晨及 16:10 後）均為已收盤
         if 900 <= time_num < 930:
             return "PRE"
         elif 930 <= time_num < 1200:
@@ -572,7 +810,7 @@ def predict_prices_with_13_models(df: pd.DataFrame):
         return None
 
 # ----------------------------------------------------------------------
-# 審計對比算法 (自動去重並確保歷程簡潔)
+# 審計對比算法
 # ----------------------------------------------------------------------
 def update_pred_audit(symbol: str, df: pd.DataFrame, session: str, pred_res: dict):
     symbol = symbol.strip().upper()
@@ -701,8 +939,16 @@ def process_single_stock(symbol: str):
     history_logs = update_pred_audit(symbol, df, session, pred_res)
     pos_str, stop_loss, take_profit, trailing_stop = calculate_dynamic_risk(curr_price, atr)
     
-    # 自動爬取近 30 天重點事件與業績日曆
     upcoming_events = fetch_stock_events(symbol)
+
+    # 計算升級版的期權量化風險建議數據
+    options_rec = calculate_options_recommendation(
+        symbol=symbol,
+        df=df,
+        score=score,
+        shock_data=shock_data,
+        events=upcoming_events
+    )
 
     session_map = {
         "PRE": "🌅 盤前/24小時盤",
@@ -744,6 +990,7 @@ def process_single_stock(symbol: str):
         "reasons": reasons,
         "signals": signals,
         "upcoming_events": upcoming_events,
+        "options_rec": options_rec,
         "last_update": datetime.now(ZoneInfo("Asia/Hong_Kong")).strftime("%H:%M:%S"),
         "tech": {
             "rsi": round(float(latest['RSI']), 1),
@@ -826,7 +1073,6 @@ def delete_stock(symbol: str):
 
 @app.post("/api/test-alert")
 def trigger_test_alert():
-    """模擬發送測試警訊 API"""
     alert_history = GLOBAL_STATE.get("alert_history", [])
     time_str = datetime.now(ZoneInfo("Asia/Hong_Kong")).strftime("%m-%d %H:%M:%S")
     test_id = f"TEST_{datetime.now().timestamp()}"
@@ -845,7 +1091,7 @@ def trigger_test_alert():
     return {"status": "ok", "alert": test_alert}
 
 # ----------------------------------------------------------------------
-# 網頁控制台前端
+# 網頁控制台前端 (已全面支援 BSM Greeks 與壓力測試 UI)
 # ----------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -878,7 +1124,7 @@ def index():
                     全自動即時連線中
                 </span>
             </div>
-            <p class="text-xs text-gray-400 mt-1">13 大 AI 機器學習模型全自動持續更新 + 未來 30 天重大事件/業績自動追蹤</p>
+            <p class="text-xs text-gray-400 mt-1">13 大 AI 機器學習模型全自動持續更新 + BSM 期權風險量化引擎 (Greeks / PoP / Stress Test)</p>
         </div>
         <div class="flex items-center gap-2">
             <input type="text" id="stockInput" placeholder="輸入代碼 (例: 3466.HK, NVDA)" 
@@ -912,7 +1158,6 @@ def index():
 
     </main>
 
-    <!-- 🚨 強效彈出警訊小型視窗 Modal -->
     <div id="alertModal" class="fixed inset-0 bg-black/80 backdrop-blur-md hidden flex items-center justify-center z-50 p-4 transition-all duration-300">
         <div class="card-bg alert-modal-glow rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4 transform scale-100">
             <div class="flex justify-between items-center border-b border-gray-800 pb-3">
@@ -923,9 +1168,7 @@ def index():
                 <button onclick="closeAlertModal()" class="text-gray-400 hover:text-white font-bold text-2xl leading-none">&times;</button>
             </div>
             
-            <div id="alertModalBody" class="space-y-3 max-h-80 overflow-y-auto pr-1">
-                <!-- 動態注入警訊內容 -->
-            </div>
+            <div id="alertModalBody" class="space-y-3 max-h-80 overflow-y-auto pr-1"></div>
 
             <div class="pt-2 border-t border-gray-800">
                 <button onclick="closeAlertModal()" class="w-full bg-gradient-to-r from-amber-600 to-rose-600 hover:from-amber-500 hover:to-rose-500 text-white font-black py-2.5 rounded-xl shadow-lg transition duration-200 text-sm tracking-wide">
@@ -1081,7 +1324,7 @@ def index():
                             </div>
                             <div class="text-xs text-cyan-300 flex items-center gap-2">
                                 <span class="inline-block w-2 h-2 rounded-full bg-cyan-400 animate-ping"></span>
-                                <span>系統正在全自動初始化並進行 13 大 AI 模型擬合...</span>
+                                <span>系統正在全自動初始化並進行 13 大 AI 模型與 BSM 期權風險擬合...</span>
                             </div>
                         </div>
                     `;
@@ -1092,6 +1335,7 @@ def index():
                 const r = item.risk;
                 const s = item.shock_data;
                 const ev = item.upcoming_events || [];
+                const opt = item.options_rec;
 
                 const reasonsHtml = item.reasons.map(r => `<div>${r}</div>`).join('');
                 
@@ -1112,6 +1356,86 @@ def index():
                             </div>
                         </div>
                     `).join('');
+                }
+
+                let optionsHtml = '';
+                if(opt) {
+                    let greeksHtml = '';
+                    if(opt.greeks && Object.keys(opt.greeks).length > 0) {
+                        greeksHtml = `
+                            <div class="mt-2 pt-2 border-t border-purple-900/40 grid grid-cols-2 sm:grid-cols-3 gap-2 text-[11px]">
+                                <div>• 30D 年化波動率: <span class="text-white font-bold">${opt.greeks.hv_30d || 'N/A'}</span></div>
+                                ${opt.greeks.est_premium ? `<div>• 理論權利金: <span class="text-amber-300 font-bold">${opt.greeks.est_premium}</span></div>` : ''}
+                                ${opt.greeks.delta ? `<div>• Delta (Δ): <span class="text-cyan-300 font-bold">${opt.greeks.delta}</span></div>` : ''}
+                                ${opt.greeks.gamma ? `<div>• Gamma (Γ): <span class="text-cyan-300 font-bold">${opt.greeks.gamma}</span></div>` : ''}
+                                ${opt.greeks.theta ? `<div>• Theta (Θ): <span class="text-emerald-300 font-bold">${opt.greeks.theta}</span></div>` : ''}
+                                ${opt.greeks.vega ? `<div>• Vega (ν): <span class="text-purple-300 font-bold">${opt.greeks.vega}</span></div>` : ''}
+                            </div>
+                        `;
+                    }
+
+                    let riskMetricsHtml = '';
+                    if(opt.risk_metrics && Object.keys(opt.risk_metrics).length > 0) {
+                        riskMetricsHtml = `
+                            <div class="mt-2 pt-2 border-t border-purple-900/40 grid grid-cols-1 sm:grid-cols-2 gap-1 text-[11px]">
+                                ${opt.risk_metrics.pop ? `<div>• 到期勝率 (PoP): <span class="text-emerald-400 font-bold">${opt.risk_metrics.pop}</span></div>` : ''}
+                                ${opt.risk_metrics.max_loss ? `<div>• 最大風險損失: <span class="text-rose-400 font-bold">${opt.risk_metrics.max_loss}</span></div>` : ''}
+                                ${opt.risk_metrics.max_gain ? `<div>• 最大可能收益: <span class="text-emerald-400 font-bold">${opt.risk_metrics.max_gain}</span></div>` : ''}
+                                ${opt.risk_metrics.var_95 ? `<div>• 正股 95% VaR: <span class="text-amber-400 font-bold">${opt.risk_metrics.var_95}</span></div>` : ''}
+                                ${opt.risk_metrics.breakeven ? `<div>• 損益平衡點: <span class="text-white font-bold">${opt.risk_metrics.breakeven}</span></div>` : ''}
+                                ${opt.risk_metrics.risk_reward ? `<div>• 理論盈虧比: <span class="text-cyan-300 font-bold">${opt.risk_metrics.risk_reward}</span></div>` : ''}
+                            </div>
+                        `;
+                    }
+
+                    let stressTestHtml = '';
+                    if(opt.stress_test && opt.stress_test.length > 0) {
+                        const rows = opt.stress_test.map(st => `
+                            <tr class="border-b border-purple-900/30 text-center text-[10px]">
+                                <td class="py-1 px-1 font-bold ${st.price_change.includes('+') ? 'text-emerald-400' : (st.price_change.includes('-') ? 'text-rose-400' : 'text-gray-300')}">${st.price_change}</td>
+                                <td class="py-1 px-1 font-mono">$${st.target_price}</td>
+                                <td class="py-1 px-1 font-mono">$${st.opt_price}</td>
+                                <td class="py-1 px-1 font-bold ${st.pnl_pct.includes('+') ? 'text-emerald-400' : (st.pnl_pct.includes('-') ? 'text-rose-400' : 'text-gray-300')}">${st.pnl_pct}</td>
+                            </tr>
+                        `).join('');
+
+                        stressTestHtml = `
+                            <div class="mt-2 pt-2 border-t border-purple-900/40">
+                                <div class="text-[11px] font-bold text-purple-300 mb-1.5 flex items-center gap-1">
+                                    <span>⚡ 價格變動壓力測試 (PnL Simulation):</span>
+                                </div>
+                                <table class="w-full text-left border-collapse">
+                                    <thead>
+                                        <tr class="border-b border-purple-800/60 text-[10px] text-purple-300 text-center bg-purple-950/60">
+                                            <th class="py-1">標的漲跌</th>
+                                            <th class="py-1">預估股價</th>
+                                            <th class="py-1">期權估價</th>
+                                            <th class="py-1">預期 PnL</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>${rows}</tbody>
+                                </table>
+                            </div>
+                        `;
+                    }
+
+                    optionsHtml = `
+                        <div class="space-y-1">
+                            <div class="text-xs font-bold text-purple-400 flex items-center gap-1">
+                                <span>🎯 AI 期權風險量化與交易建議 (BSM Engine)：</span>
+                            </div>
+                            <div class="bg-purple-950/40 border border-purple-900/60 rounded-lg p-3 text-xs text-purple-200 space-y-1 font-mono">
+                                <div class="font-bold text-sm text-purple-300">${opt.strategy}</div>
+                                <div>• 建議行使價: <span class="text-white font-bold">${opt.strike_price || '無'}</span></div>
+                                <div>• 建議到期日: <span class="text-white font-bold">${opt.exp_date || '無'}</span></div>
+                                <div class="text-amber-300">• 提前平倉目標: ${opt.take_profit_target}</div>
+                                <div class="text-[11px] text-gray-400 mt-1">• 量化說明: ${opt.reason}</div>
+                                ${greeksHtml}
+                                ${riskMetricsHtml}
+                                ${stressTestHtml}
+                            </div>
+                        </div>
+                    `;
                 }
 
                 let modelsHtml = '<div>全自動運算中...</div>';
@@ -1171,7 +1495,6 @@ def index():
                             </div>
                         </div>
 
-                        <!-- 📅 未來 30 天重大事件與季度業績預警框框 -->
                         <div class="space-y-1">
                             <div class="text-xs font-bold text-amber-400 flex items-center gap-1">
                                 <span>📅【未來 30 天】影響股價重大事件與業績預警：</span>
@@ -1188,6 +1511,8 @@ def index():
                             <div class="text-xs text-gray-300 font-bold mt-2">【打分理由】</div>
                             <div class="text-xs text-gray-300 space-y-0.5 mt-1 leading-relaxed">${reasonsHtml}</div>
                         </div>
+
+                        ${optionsHtml}
 
                         <div class="space-y-1">
                             <div class="text-xs font-bold text-gray-400">📊 技術細節：</div>

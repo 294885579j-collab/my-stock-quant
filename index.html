@@ -9,6 +9,9 @@
         .chat-scroll::-webkit-scrollbar { width: 6px; }
         .chat-scroll::-webkit-scrollbar-track { background: #0f172a; }
         .chat-scroll::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+        /* 隱藏 details 預設的原生三角形 */
+        details > summary { list-style: none; }
+        details > summary::-webkit-details-marker { display: none; }
     </style>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen font-sans">
@@ -21,7 +24,7 @@
                 <h1 class="text-lg font-extrabold bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent">
                     股票即時監控 & Telegram 動態頻道
                 </h1>
-                <p class="text-[11px] text-slate-400">13 ML模型預測 x 實時條件警訊推播</p>
+                <p class="text-[11px] text-slate-400">13 ML模型預測 x 實時條件警訊與 AI 期權推播</p>
             </div>
         </div>
         <div class="flex items-center gap-2">
@@ -53,8 +56,8 @@
             </div>
         </div>
 
-        <!-- 追蹤標的即時價格卡片 -->
-        <div id="ticker-bar" class="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 gap-3">
+        <!-- 追蹤標的即時價格與期權建議卡片 -->
+        <div id="ticker-bar" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
             <!-- JavaScript 動態填入 -->
         </div>
 
@@ -71,6 +74,7 @@
                     <button onclick="filterFeed('ALL')" id="filter-ALL" class="px-2.5 py-1 rounded bg-cyan-600 text-white font-bold">全部</button>
                     <button onclick="filterFeed('ALERT')" id="filter-ALERT" class="px-2.5 py-1 rounded bg-slate-800 text-slate-400 hover:bg-slate-700">🚨 警訊</button>
                     <button onclick="filterFeed('ML')" id="filter-ML" class="px-2.5 py-1 rounded bg-slate-800 text-slate-400 hover:bg-slate-700">🤖 13-ML預測</button>
+                    <button onclick="filterFeed('OPTIONS')" id="filter-OPTIONS" class="px-2.5 py-1 rounded bg-slate-800 text-slate-400 hover:bg-slate-700">🎯 期權建議</button>
                 </div>
             </div>
 
@@ -86,6 +90,20 @@
         let currentFilter = 'ALL';
         let rawFeedData = [];
 
+        // 記憶使用者展開狀態，避免 4 秒輪詢更新時強制關閉選單
+        const expandedOptions = new Set();
+        const expandedFeed = new Set();
+
+        function toggleOptionState(symbol, isOpen) {
+            if (isOpen) expandedOptions.add(symbol);
+            else expandedOptions.delete(symbol);
+        }
+
+        function toggleFeedState(msgId, isOpen) {
+            if (isOpen) expandedFeed.add(msgId);
+            else expandedFeed.delete(msgId);
+        }
+
         // 渲染 Telegram 訊息卡片
         function renderFeed() {
             const chatBox = document.getElementById('chat-feed');
@@ -100,7 +118,7 @@
                 return;
             }
 
-            chatBox.innerHTML = filteredFeed.map(msg => {
+            chatBox.innerHTML = filteredFeed.map((msg, index) => {
                 let badgeStyle = "bg-slate-800 text-slate-300 border-slate-700";
                 let borderStyle = "border-slate-800 bg-slate-900/80";
                 
@@ -113,13 +131,34 @@
                 } else if (msg.level === "success") {
                     badgeStyle = "bg-emerald-950 text-emerald-400 border-emerald-800";
                     borderStyle = "border-emerald-900/50 bg-emerald-950/20";
+                } else if (msg.level === "purple") {
+                    badgeStyle = "bg-purple-950 text-purple-300 border-purple-800";
+                    borderStyle = "border-purple-900/50 bg-purple-950/20";
                 } else if (msg.level === "cyan") {
                     badgeStyle = "bg-cyan-950 text-cyan-300 border-cyan-800";
                     borderStyle = "border-cyan-900/50 bg-cyan-950/20";
                 }
 
-                // 替換內文換行符號為 <br>
-                const formattedContent = msg.content.replace(/\n/g, '<br>');
+                const msgId = `${msg.timestamp}_${msg.symbol}_${index}`;
+                const isExpanded = expandedFeed.has(msgId);
+                let contentBody = msg.content.replace(/\n/g, '<br>');
+
+                // 若為期權訊息，在頻道內容中也支援折疊顯示
+                if (msg.type === 'OPTIONS') {
+                    contentBody = `
+                        <details ${isExpanded ? 'open' : ''} ontoggle="toggleFeedState('${msgId}', this.open)" class="group/feedopt">
+                            <summary class="cursor-pointer text-xs text-cyan-400 hover:text-cyan-300 font-semibold py-1 select-none flex items-center justify-between">
+                                <span>🎯 點擊展開/折疊期權建議詳情</span>
+                                <span class="text-[10px] group-open/feedopt:rotate-180 transition-transform duration-200">▼</span>
+                            </summary>
+                            <div class="mt-1.5 pt-2 border-t border-slate-800/80 text-xs text-slate-300 leading-relaxed font-sans">
+                                ${contentBody}
+                            </div>
+                        </details>
+                    `;
+                } else {
+                    contentBody = `<div class="text-xs text-slate-300 leading-relaxed font-sans">${contentBody}</div>`;
+                }
 
                 return `
                     <div class="p-3.5 rounded-xl border ${borderStyle} shadow-md space-y-1.5 transition">
@@ -130,7 +169,7 @@
                             <span class="text-[10px] text-slate-500 font-mono">${msg.timestamp}</span>
                         </div>
                         <div class="text-sm font-bold text-slate-100">${msg.title}</div>
-                        <div class="text-xs text-slate-300 leading-relaxed font-sans">${formattedContent}</div>
+                        ${contentBody}
                     </div>
                 `;
             }).join('');
@@ -138,12 +177,14 @@
 
         function filterFeed(type) {
             currentFilter = type;
-            ['ALL', 'ALERT', 'ML'].forEach(t => {
+            ['ALL', 'ALERT', 'ML', 'OPTIONS'].forEach(t => {
                 const btn = document.getElementById(`filter-${t}`);
-                if (t === type) {
-                    btn.className = "px-2.5 py-1 rounded bg-cyan-600 text-white font-bold";
-                } else {
-                    btn.className = "px-2.5 py-1 rounded bg-slate-800 text-slate-400 hover:bg-slate-700";
+                if (btn) {
+                    if (t === type) {
+                        btn.className = "px-2.5 py-1 rounded bg-cyan-600 text-white font-bold";
+                    } else {
+                        btn.className = "px-2.5 py-1 rounded bg-slate-800 text-slate-400 hover:bg-slate-700";
+                    }
                 }
             });
             renderFeed();
@@ -191,25 +232,61 @@
                 const res = await fetch('/api/state');
                 const data = await res.json();
 
-                // 1. 渲染追蹤標的即時價格卡片 (含手動觸發 ML 按鈕與刪除按鈕)
                 const tickerBar = document.getElementById('ticker-bar');
-                if (data.prices) {
-                    tickerBar.innerHTML = Object.entries(data.prices).map(([symbol, price]) => `
-                        <div class="relative p-3 rounded-xl border bg-slate-900 border-slate-800 text-center group hover:border-slate-700 transition">
-                            <button onclick="removeStock('${symbol}')" 
-                                    class="absolute top-1 right-2 text-slate-500 hover:text-red-400 font-bold text-xs p-1" 
-                                    title="移除追蹤">✕</button>
-                            <div class="text-xs text-slate-400 font-bold">${symbol}</div>
-                            <div class="text-base font-bold text-emerald-400 my-0.5">$${price ? price.toFixed(2) : '---'}</div>
-                            <button onclick="triggerML('${symbol}')" 
-                                    class="text-[10px] bg-slate-800 hover:bg-cyan-950 text-cyan-400 hover:text-cyan-300 border border-slate-700 px-2 py-0.5 rounded transition">
-                                🤖 執行 ML 預測
-                            </button>
-                        </div>
-                    `).join('');
+                if (data.states) {
+                    tickerBar.innerHTML = Object.entries(data.states).map(([symbol, stockState]) => {
+                        const price = stockState.current_price;
+                        const opt = stockState.options_rec;
+                        const isExpanded = expandedOptions.has(symbol);
+                        
+                        let optBadge = '<span class="text-gray-400">無期權建議</span>';
+                        let hasDetails = false;
+
+                        if (opt) {
+                            if (opt.action === 'BUY_CALL') optBadge = `<span class="text-emerald-400 font-bold">${opt.strategy}</span>`;
+                            else if (opt.action === 'SELL_PUT') optBadge = `<span class="text-purple-400 font-bold">${opt.strategy}</span>`;
+                            else optBadge = `<span class="text-gray-400 font-bold">${opt.strategy}</span>`;
+
+                            if (opt.strike_price || opt.take_profit_target) {
+                                hasDetails = true;
+                            }
+                        }
+
+                        return `
+                            <div class="relative p-3 rounded-xl border bg-slate-900 border-slate-800 text-left group hover:border-slate-700 transition space-y-1">
+                                <button onclick="removeStock('${symbol}')" 
+                                        class="absolute top-1 right-2 text-slate-500 hover:text-red-400 font-bold text-xs p-1" 
+                                        title="移除追蹤">✕</button>
+                                <div class="flex justify-between items-center pr-4">
+                                    <span class="text-xs text-slate-400 font-bold">${symbol}</span>
+                                    <span class="text-sm font-bold text-emerald-400 font-mono">$${price ? price.toFixed(2) : '---'}</span>
+                                </div>
+
+                                <!-- 期權折疊選單區塊 -->
+                                <details ${isExpanded ? 'open' : ''} ontoggle="toggleOptionState('${symbol}', this.open)" class="text-[11px] border-t border-slate-800/80 pt-1 group/opt">
+                                    <summary class="${hasDetails ? 'cursor-pointer hover:bg-slate-800/50 rounded' : 'cursor-default'} flex justify-between items-center py-0.5 select-none">
+                                        <div>${optBadge}</div>
+                                        ${hasDetails ? `<span class="text-[10px] text-slate-500 group-open/opt:rotate-180 transition-transform duration-200">▼</span>` : ''}
+                                    </summary>
+                                    ${hasDetails ? `
+                                        <div class="mt-1 pl-2 border-l border-slate-700 space-y-0.5 pb-1">
+                                            ${opt.strike_price ? `<div class="text-[10px] text-slate-400">行使價: <span class="text-slate-200 font-mono">${opt.strike_price}</span></div>` : ''}
+                                            ${opt.take_profit_target ? `<div class="text-[10px] text-amber-300">平倉目標: ${opt.take_profit_target}</div>` : ''}
+                                        </div>
+                                    ` : ''}
+                                </details>
+
+                                <div class="pt-1 flex justify-end">
+                                    <button onclick="triggerML('${symbol}')" 
+                                            class="text-[10px] bg-slate-800 hover:bg-cyan-950 text-cyan-400 hover:text-cyan-300 border border-slate-700 px-2 py-0.5 rounded transition">
+                                        🤖 ML 預測
+                                    </button>
+                                </div>
+                            </div>
+                        `;
+                    }).join('');
                 }
 
-                // 2. 更新頻道動態數據
                 if (data.feed) {
                     rawFeedData = data.feed;
                     renderFeed();
@@ -221,7 +298,7 @@
         }
 
         fetchState();
-        setInterval(fetchState, 4000); // 每 4 秒自動刷一輪頻道最新動態
+        setInterval(fetchState, 4000);
     </script>
 </body>
 </html>
