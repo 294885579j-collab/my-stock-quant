@@ -460,6 +460,99 @@ def _check_has_options(symbol: str) -> bool:
     return has
 
 
+def _select_real_option_contract(
+    symbol: str,
+    close_price: float,
+    target_strike: float,
+    option_type: str,
+    now_date: datetime.date,
+    prefer_dte: int = 35,
+) -> dict:
+    """
+    Pick a real Yahoo option contract near target DTE & strike.
+    Returns dict with strike, exp_date, dte, iv, bid, ask, last, mid, contractSymbol.
+    Falls back to empty fields if chain unavailable (caller uses theoretical).
+    """
+    result = {
+        "strike": target_strike,
+        "exp_date": None,
+        "dte": None,
+        "iv": None,
+        "bid": None,
+        "ask": None,
+        "last": None,
+        "mid": None,
+        "contract": None,
+        "source": "theoretical",
+    }
+    try:
+        stock = yf.Ticker(symbol)
+        exps = list(getattr(stock, "options", None) or [])
+        if not exps:
+            return result
+
+        # Choose expiration closest to prefer_dte (and at least 7 DTE)
+        best_exp = None
+        best_diff = 10**9
+        for e in exps:
+            try:
+                ed = datetime.strptime(e, "%Y-%m-%d").date()
+            except Exception:
+                continue
+            dte = (ed - now_date).days
+            if dte < 7:
+                continue
+            diff = abs(dte - prefer_dte)
+            if diff < best_diff:
+                best_diff = diff
+                best_exp = e
+        if best_exp is None:
+            # take farthest available if all short-dated
+            best_exp = exps[-1]
+
+        exp_dt = datetime.strptime(best_exp, "%Y-%m-%d").date()
+        dte = max(1, (exp_dt - now_date).days)
+        chain = stock.option_chain(best_exp)
+        table = chain.calls if option_type == "call" else chain.puts
+        if table is None or table.empty:
+            result["exp_date"] = best_exp
+            result["dte"] = dte
+            return result
+
+        # Nearest strike to target
+        table = table.copy()
+        table["strike_diff"] = (table["strike"] - target_strike).abs()
+        row = table.loc[table["strike_diff"].idxmin()]
+        strike = float(row["strike"])
+        bid = float(row["bid"]) if pd.notna(row.get("bid")) else None
+        ask = float(row["ask"]) if pd.notna(row.get("ask")) else None
+        last = float(row["lastPrice"]) if pd.notna(row.get("lastPrice")) else None
+        iv = float(row["impliedVolatility"]) if pd.notna(row.get("impliedVolatility")) else None
+        if iv is not None and (iv <= 0 or iv > 5):
+            iv = None  # junk
+        mid = None
+        if bid is not None and ask is not None and bid > 0 and ask > 0:
+            mid = round((bid + ask) / 2, 2)
+        elif last is not None and last > 0:
+            mid = round(last, 2)
+
+        result.update({
+            "strike": round(strike, 2),
+            "exp_date": best_exp,
+            "dte": dte,
+            "iv": iv,
+            "bid": bid,
+            "ask": ask,
+            "last": last,
+            "mid": mid,
+            "contract": str(row.get("contractSymbol", "")) or None,
+            "source": "yahoo_chain",
+        })
+    except Exception:
+        pass
+    return result
+
+
 def calculate_options_recommendation(
     symbol: str,
     df: pd.DataFrame,
@@ -468,10 +561,11 @@ def calculate_options_recommendation(
     events: list
 ) -> dict:
     """
-    Quant options engine with explicit decision audit trail.
-    Returns the same structure as before + a new "debug" key that explains
-    exactly which gate produced the recommendation. This makes Mac vs
-    cloud differences immediately visible.
+    Quant options engine:
+    - Decision gates unchanged
+    - Strike/expiry prefer REAL chain contracts
+    - Sigma prefers market IV when available, else 30D HV
+    - Short-put PoP = N(d2) = P(S_T > K) under RN measure
     """
     debug = {
         "score": score,
@@ -590,7 +684,7 @@ def calculate_options_recommendation(
             "reason": (
                 "近 7 天有重大業績發佈、股價極致震盪或技術打分偏弱，"
                 "波動率溢價 (IV Crush Risk) 過高或方向極不明確。"
-                f" 詳見除錯：{debug['reason_detail']}"
+                f"（{debug['reason_detail']}）"
             ),
             "strike_price": "N/A",
             "exp_date": "N/A",
@@ -606,19 +700,32 @@ def calculate_options_recommendation(
 
     # Gate 4: strong bull → Buy Call
     if score >= SCORE_STRONG_BULL:
-        strike = round(close_price + (1.0 * atr), 2)
+        ideal_strike = round(close_price + (1.0 * atr), 2)
+        contract = _select_real_option_contract(
+            symbol, close_price, ideal_strike, "call", now_date, prefer_dte=35
+        )
+        strike = float(contract["strike"])
+        if contract.get("exp_date"):
+            exp_date = contract["exp_date"]
+            days_to_exp = int(contract["dte"] or days_to_exp)
+            T = days_to_exp / 365.0
         pct_otm = round((strike / close_price - 1) * 100, 1)
 
-        bs_res = bs_greeks_and_price(close_price, strike, T, r, hv_30d, "call")
-        call_price = max(bs_res["price"], 0.01)
+        sigma = float(contract["iv"]) if contract.get("iv") else hv_30d
+        sigma_label = "IV" if contract.get("iv") else "HV"
+        bs_res = bs_greeks_and_price(close_price, strike, T, r, sigma, "call")
+        theo = max(bs_res["price"], 0.01)
+        # Prefer market mid for premium estimate when buying
+        call_price = float(contract["mid"]) if contract.get("mid") else theo
+        call_price = max(call_price, 0.01)
 
-        var_95_stock = 1.645 * hv_30d * np.sqrt(T) * close_price
-        pop_pct = round(bs_res["pop"] * 100, 1)
+        var_95_stock = 1.645 * sigma * np.sqrt(T) * close_price
+        pop_pct = round(bs_res["pop"] * 100, 1)  # call: P(S_T > K)
 
         stress_test = []
         for change_pct in [-10, -5, 0, 5, 10]:
             sim_s = close_price * (1 + change_pct / 100.0)
-            sim_res = bs_greeks_and_price(sim_s, strike, T, r, hv_30d, "call")
+            sim_res = bs_greeks_and_price(sim_s, strike, T, r, sigma, "call")
             sim_pnl = ((sim_res["price"] - call_price) / call_price) * 100
             stress_test.append({
                 "price_change": f"{change_pct:+d}%",
@@ -627,17 +734,26 @@ def calculate_options_recommendation(
                 "pnl_pct": f"{sim_pnl:+.1f}%"
             })
 
+        mkt_note = ""
+        if contract.get("bid") is not None and contract.get("ask") is not None:
+            mkt_note = f"｜市價 Bid/Ask ${contract['bid']:.2f}/${contract['ask']:.2f}"
+        src = contract.get("source", "theoretical")
+
         debug["gate"] = "BUY_CALL"
-        debug["reason_detail"] = f"score {score} >= {SCORE_STRONG_BULL}"
+        debug["reason_detail"] = f"score {score} >= {SCORE_STRONG_BULL} | chain={src}"
         return {
             "strategy": "🐂 建議 Buy Call (買看漲期權)",
             "action": "BUY_CALL",
-            "reason": f"技術面得分為強勢多頭區間 ({score}分)，採用 Buy Call 槓桿參與上漲行情。",
+            "reason": (
+                f"技術面得分為強勢多頭區間 ({score}分)，採用 Buy Call 槓桿參與上漲行情。"
+                f" 合約來源: {src}{mkt_note}"
+            ),
             "strike_price": f"${strike} (OTM +{pct_otm}%)",
             "exp_date": f"{exp_date} ({days_to_exp} 天 DTE)",
             "take_profit_target": "權利金獲利 +50% ~ +100% 或正股觸及布林上軌時提前平倉",
             "greeks": {
                 "hv_30d": f"{hv_30d*100:.1f}%",
+                "sigma": f"{sigma*100:.1f}% ({sigma_label})",
                 "est_premium": f"${call_price:.2f}",
                 "delta": f"{bs_res['delta']:.3f}",
                 "gamma": f"{bs_res['gamma']:.4f}",
@@ -648,29 +764,46 @@ def calculate_options_recommendation(
                 "pop": f"{pop_pct}% (到期價內勝率)",
                 "max_loss": f"${call_price:.2f} / 股 (${call_price*100:.0f} / 張)",
                 "var_95": f"${var_95_stock:.2f} (正股 95% 波動風險值)",
-                "risk_reward": f"1 : {(atr*2)/call_price:.1f} (理論盈虧比)"
+                "risk_reward": f"1 : {(atr*2)/call_price:.1f} (理論盈虧比)",
+                "contract": contract.get("contract") or "N/A",
             },
             "stress_test": stress_test,
             "debug": debug
         }
 
     # Gate 5: neutral → Sell Put
-    strike = round(min(close_price - (1.5 * atr), bb_lower), 2)
+    ideal_strike = round(min(close_price - (1.5 * atr), bb_lower), 2)
+    contract = _select_real_option_contract(
+        symbol, close_price, ideal_strike, "put", now_date, prefer_dte=35
+    )
+    strike = float(contract["strike"])
+    if contract.get("exp_date"):
+        exp_date = contract["exp_date"]
+        days_to_exp = int(contract["dte"] or days_to_exp)
+        T = days_to_exp / 365.0
     pct_otm = round((1 - strike / close_price) * 100, 1)
 
-    bs_res = bs_greeks_and_price(close_price, strike, T, r, hv_30d, "put")
-    put_price = max(bs_res["price"], 0.01)
+    sigma = float(contract["iv"]) if contract.get("iv") else hv_30d
+    sigma_label = "IV" if contract.get("iv") else "HV"
+    bs_res = bs_greeks_and_price(close_price, strike, T, r, sigma, "put")
+    theo = max(bs_res["price"], 0.01)
+    # Selling: conservative credit ≈ bid if available, else mid/theo
+    if contract.get("bid") is not None and contract["bid"] > 0:
+        put_price = float(contract["bid"])
+    elif contract.get("mid"):
+        put_price = float(contract["mid"])
+    else:
+        put_price = theo
+    put_price = max(put_price, 0.01)
 
-    # PoP for short put ≈ probability that S_T > K = N(d2) of the put's d2 under risk-neutral
-    # Original code used 1 - N(d2); we keep consistent with previous behaviour.
-    pop_pct = round((1.0 - norm.cdf(bs_res["d2"])) * 100, 1)
-    var_95_stock = 1.645 * hv_30d * np.sqrt(T) * close_price
+    # Short put profit if S_T > K → PoP = N(d2)
+    pop_pct = round(norm.cdf(bs_res["d2"]) * 100, 1)
+    var_95_stock = 1.645 * sigma * np.sqrt(T) * close_price
 
     stress_test = []
     for change_pct in [-10, -5, 0, 5, 10]:
         sim_s = close_price * (1 + change_pct / 100.0)
-        sim_res = bs_greeks_and_price(sim_s, strike, T, r, hv_30d, "put")
-        # For short put, PnL = premium received - new put price
+        sim_res = bs_greeks_and_price(sim_s, strike, T, r, sigma, "put")
         sim_pnl_dollar = put_price - sim_res["price"]
         sim_pnl_pct = (sim_pnl_dollar / put_price) * 100
         stress_test.append({
@@ -680,17 +813,28 @@ def calculate_options_recommendation(
             "pnl_pct": f"{sim_pnl_pct:+.1f}%"
         })
 
+    mkt_note = ""
+    if contract.get("bid") is not None and contract.get("ask") is not None:
+        mkt_note = f"｜市價 Bid/Ask ${contract['bid']:.2f}/${contract['ask']:.2f}"
+    src = contract.get("source", "theoretical")
+
     debug["gate"] = "SELL_PUT"
-    debug["reason_detail"] = f"{SCORE_NEUTRAL_FLOOR} <= score {score} < {SCORE_STRONG_BULL}"
+    debug["reason_detail"] = (
+        f"{SCORE_NEUTRAL_FLOOR} <= score {score} < {SCORE_STRONG_BULL} | chain={src}"
+    )
     return {
         "strategy": "🛡️ 建議 Sell Put (賣看跌期權/收取權利金)",
         "action": "SELL_PUT",
-        "reason": f"技術面處於中性盤整區間 ({score}分)，適合透過 Sell Put 賺取時間價值衰減 (Theta decay)。",
+        "reason": (
+            f"技術面處於中性盤整區間 ({score}分)，適合透過 Sell Put 賺取時間價值衰減 (Theta decay)。"
+            f" 合約來源: {src}{mkt_note}"
+        ),
         "strike_price": f"${strike} (OTM -{pct_otm}%)",
         "exp_date": f"{exp_date} ({days_to_exp} 天 DTE)",
         "take_profit_target": "當獲得最大權利金收益之 50% ~ 75% 時提前買回平倉 (Buy to Close)",
         "greeks": {
             "hv_30d": f"{hv_30d*100:.1f}%",
+            "sigma": f"{sigma*100:.1f}% ({sigma_label})",
             "est_premium": f"${put_price:.2f}",
             "delta": f"{bs_res['delta']:.3f}",
             "gamma": f"{bs_res['gamma']:.4f}",
@@ -701,7 +845,8 @@ def calculate_options_recommendation(
             "pop": f"{pop_pct}% (到期不履約/獲利勝率)",
             "max_gain": f"${put_price:.2f} / 股 (${put_price*100:.0f} / 張)",
             "var_95": f"${var_95_stock:.2f} (正股 95% 波動風險值)",
-            "breakeven": f"${strike - put_price:.2f} (損益平衡點)"
+            "breakeven": f"${strike - put_price:.2f} (損益平衡點)",
+            "contract": contract.get("contract") or "N/A",
         },
         "stress_test": stress_test,
         "debug": debug
@@ -1053,8 +1198,106 @@ def calculate_rigorous_score(df: pd.DataFrame):
 # ----------------------------------------------------------------------
 # 13 大 AI 機器學習預估引擎
 # ----------------------------------------------------------------------
-def predict_prices_with_13_models(df: pd.DataFrame):
+def _get_model_weights(symbol: str, model_names: List[str]) -> Dict[str, float]:
+    """
+    Inverse-MAE weights from historical verification feedback loop.
+    Models with lower O/H/L mean absolute error get higher weight.
+    Cold-start → equal weights.
+    """
+    maes = GLOBAL_STATE.get("model_maes", {}).get(symbol, {})
+    raw = {}
+    for name in model_names:
+        info = maes.get(name, {})
+        mae = float(info.get("mae_ohl", 0) or 0)
+        n = int(info.get("n", 0) or 0)
+        # Need at least 2 settled samples before trusting MAE
+        if n >= 2 and mae > 0:
+            raw[name] = 1.0 / (mae + 1e-6)
+        else:
+            raw[name] = 1.0
+    total = sum(raw.values()) or 1.0
+    return {k: v / total for k, v in raw.items()}
+
+
+def _update_model_maes(symbol: str, model_preds: List[dict], actual_open: float, actual_high: float, actual_low: float):
+    """Exponential-ish running MAE per model after a day is fully settled."""
+    if not model_preds or actual_open <= 0:
+        return
+    store = GLOBAL_STATE.setdefault("model_maes", {})
+    sym_maes = store.setdefault(symbol, {})
+    alpha = 0.35  # weight on newest error
+
+    for m in model_preds:
+        name = m.get("name")
+        if not name:
+            continue
+        err = (
+            abs(float(m.get("open", 0)) - actual_open)
+            + abs(float(m.get("high", 0)) - actual_high)
+            + abs(float(m.get("low", 0)) - actual_low)
+        ) / 3.0
+        prev = sym_maes.get(name, {"mae_ohl": err, "n": 0})
+        n = int(prev.get("n", 0)) + 1
+        old_mae = float(prev.get("mae_ohl", err))
+        new_mae = err if n == 1 else (1 - alpha) * old_mae + alpha * err
+        sym_maes[name] = {"mae_ohl": round(new_mae, 4), "n": n}
+
+    # Ensemble-level stats for confidence display
+    ens = sym_maes.get("_ensemble", {"mae_ohl": 0.0, "n": 0, "open_hits": 0})
+    # caller also passes ensemble diffs via side channel — updated in audit
+    store[symbol] = sym_maes
+
+
+def _ensemble_accuracy_summary(symbol: str) -> dict:
+    """Build human-readable accuracy stats for UI."""
+    maes = GLOBAL_STATE.get("model_maes", {}).get(symbol, {})
+    ens = maes.get("_ensemble", {})
+    n = int(ens.get("n", 0) or 0)
+    mae = float(ens.get("mae_ohl", 0) or 0)
+    open_hits = int(ens.get("open_hits", 0) or 0)
+    open_hit_pct = round(100.0 * open_hits / n, 1) if n > 0 else None
+
+    # Rank models by MAE (best first)
+    ranked = []
+    for name, info in maes.items():
+        if name.startswith("_"):
+            continue
+        if int(info.get("n", 0) or 0) >= 2:
+            ranked.append((name, float(info.get("mae_ohl", 999))))
+    ranked.sort(key=lambda x: x[1])
+
+    if n >= 5 and mae > 0:
+        if mae < 1.5:
+            conf = "高"
+        elif mae < 3.0:
+            conf = "中"
+        else:
+            conf = "低"
+        conf_text = f"{conf} (近 {n} 日 MAE ${mae:.2f}"
+        if open_hit_pct is not None:
+            conf_text += f", 開盤方向命中 {open_hit_pct}%"
+        conf_text += ")"
+    elif n > 0:
+        conf_text = f"累積中 (已結算 {n} 日)"
+    else:
+        conf_text = "冷啟動 (等結算回饋)"
+
+    return {
+        "confidence": conf_text,
+        "settled_n": n,
+        "ensemble_mae": round(mae, 2) if n else None,
+        "open_hit_pct": open_hit_pct,
+        "top_models": [{"name": a[0], "mae": round(a[1], 2)} for a in ranked[:3]],
+    }
+
+
+def predict_prices_with_13_models(df: pd.DataFrame, symbol: str = ""):
+    """
+    13-model ensemble with inverse-MAE weighting from verification feedback.
+    Does NOT add more models — improves the existing set via learned weights.
+    """
     try:
+        symbol = (symbol or "").strip().upper()
         data = df.copy()
         data['Target_Open_Ret'] = (data['Open'].shift(-1) - data['Close']) / data['Close']
         data['Target_High_Ret'] = (data['High'].shift(-1) - data['Close']) / data['Close']
@@ -1115,10 +1358,21 @@ def predict_prices_with_13_models(df: pd.DataFrame):
         if not open_details:
             return None
 
-        avg_open = round(float(np.mean(list(open_details.values()))), 2)
-        avg_high = round(float(np.mean(list(high_details.values()))), 2)
-        avg_low = round(float(np.mean(list(low_details.values()))), 2)
+        weights = _get_model_weights(symbol, list(open_details.keys()))
+
+        def wavg(detail: dict) -> float:
+            s = sum(weights.get(k, 0) * v for k, v in detail.items())
+            return round(float(s), 2)
+
+        avg_open = wavg(open_details)
+        avg_high = wavg(high_details)
+        avg_low = wavg(low_details)
+        # Keep OHLC consistency
+        avg_high = max(avg_high, avg_open, round(curr_close * 1.001, 2))
+        avg_low = min(avg_low, avg_open, round(curr_close * 0.999, 2))
         open_pct = round(((avg_open - curr_close) / curr_close) * 100, 1)
+
+        acc = _ensemble_accuracy_summary(symbol)
 
         model_list = []
         for name in sorted(open_details.keys()):
@@ -1126,16 +1380,21 @@ def predict_prices_with_13_models(df: pd.DataFrame):
                 "name": name,
                 "open": open_details[name],
                 "high": high_details[name],
-                "low": low_details[name]
+                "low": low_details[name],
+                "weight": round(weights.get(name, 0) * 100, 1),  # %
             })
+        # Sort by weight desc for UI
+        model_list.sort(key=lambda x: -x["weight"])
 
         return {
             "pred_open": avg_open,
             "open_pct": f"+{open_pct}%" if open_pct >= 0 else f"{open_pct}%",
             "pred_high": avg_high,
             "pred_low": avg_low,
-            "confidence": "高 (MAE 擬合)",
-            "model_list": model_list
+            "confidence": acc["confidence"],
+            "accuracy": acc,
+            "model_list": model_list,
+            "weighted": True,
         }
     except Exception as e:
         print(f"ML Error: {e}")
@@ -1162,11 +1421,14 @@ def update_pred_audit(symbol: str, df: pd.DataFrame, session: str, pred_res: dic
     current_time_num = now_tz.hour * 100 + now_tz.minute
 
     if pred_res is not None:
+        model_snapshot = pred_res.get("model_list") or []
         if base_date_str in audit_dict:
             if not audit_dict[base_date_str].get("full_verified"):
                 audit_dict[base_date_str]["pred_open"] = pred_res["pred_open"]
                 audit_dict[base_date_str]["pred_high"] = pred_res["pred_high"]
                 audit_dict[base_date_str]["pred_low"] = pred_res["pred_low"]
+                if model_snapshot and not audit_dict[base_date_str].get("model_preds"):
+                    audit_dict[base_date_str]["model_preds"] = model_snapshot
         else:
             audit_dict[base_date_str] = {
                 "base_date": base_date_str,
@@ -1174,8 +1436,10 @@ def update_pred_audit(symbol: str, df: pd.DataFrame, session: str, pred_res: dic
                 "pred_open": pred_res["pred_open"],
                 "pred_high": pred_res["pred_high"],
                 "pred_low": pred_res["pred_low"],
+                "model_preds": model_snapshot,
                 "open_verified": False,
                 "full_verified": False,
+                "mae_updated": False,
                 "status": "⏳ 待結算"
             }
 
@@ -1221,6 +1485,46 @@ def update_pred_audit(symbol: str, df: pd.DataFrame, session: str, pred_res: dic
                     item["diff_low"] = round(abs(item["pred_low"] - act_low), 2)
                     item["full_verified"] = True
                     item["status"] = "完全結算"
+
+            # Feedback loop: update per-model MAE once when first fully settled
+            if item.get("full_verified") and not item.get("mae_updated"):
+                act_o = float(item.get("actual_open") or 0)
+                act_h = float(item.get("actual_high") or 0)
+                act_l = float(item.get("actual_low") or 0)
+                if act_o > 0 and act_h > 0 and act_l > 0:
+                    _update_model_maes(
+                        symbol,
+                        item.get("model_preds") or [],
+                        act_o, act_h, act_l,
+                    )
+                    # Ensemble MAE + open direction hit
+                    ens_err = (
+                        abs(float(item["pred_open"]) - act_o)
+                        + abs(float(item["pred_high"]) - act_h)
+                        + abs(float(item["pred_low"]) - act_l)
+                    ) / 3.0
+                    store = GLOBAL_STATE.setdefault("model_maes", {})
+                    sym = store.setdefault(symbol, {})
+                    ens = sym.get("_ensemble", {"mae_ohl": ens_err, "n": 0, "open_hits": 0})
+                    n = int(ens.get("n", 0)) + 1
+                    old = float(ens.get("mae_ohl", ens_err))
+                    alpha = 0.35
+                    new_mae = ens_err if n == 1 else (1 - alpha) * old + alpha * ens_err
+                    # Open direction: pred vs prior close approximated by sign of pred move vs actual
+                    # Hit if |pred_open - actual_open| <= 1% of price (practical tolerance)
+                    tol = max(act_o * 0.01, 0.05)
+                    hits = int(ens.get("open_hits", 0))
+                    if abs(float(item["pred_open"]) - act_o) <= tol:
+                        hits += 1
+                    sym["_ensemble"] = {
+                        "mae_ohl": round(new_mae, 4),
+                        "n": n,
+                        "open_hits": hits,
+                    }
+                    item["mae_updated"] = True
+                    # Drop bulky model_preds after feedback to keep state small
+                    if "model_preds" in item:
+                        del item["model_preds"]
 
     final_list = []
     seen_targets = set()
@@ -1270,7 +1574,7 @@ def process_single_stock(symbol: str):
     atr = float(latest['ATR'])
 
     score, reasons, advice, shock_data = calculate_rigorous_score(df)
-    pred_res = predict_prices_with_13_models(df)
+    pred_res = predict_prices_with_13_models(df, symbol=symbol)
     history_logs = update_pred_audit(symbol, df, session, pred_res)
     pos_str, stop_loss, take_profit, trailing_stop = calculate_dynamic_risk(curr_price, atr)
 
@@ -1707,7 +2011,8 @@ def index():
                         greeksHtml = `
                             <div class="mt-2 pt-2 border-t border-purple-900/40 grid grid-cols-2 sm:grid-cols-3 gap-2 text-[11px]">
                                 <div>• 30D 年化波動率: <span class="text-white font-bold">${opt.greeks.hv_30d || 'N/A'}</span></div>
-                                ${opt.greeks.est_premium ? `<div>• 理論權利金: <span class="text-amber-300 font-bold">${opt.greeks.est_premium}</span></div>` : ''}
+                                ${opt.greeks.sigma ? `<div>• 定價波動率: <span class="text-white font-bold">${opt.greeks.sigma}</span></div>` : ''}
+                                ${opt.greeks.est_premium ? `<div>• 預估權利金: <span class="text-amber-300 font-bold">${opt.greeks.est_premium}</span></div>` : ''}
                                 ${opt.greeks.delta ? `<div>• Delta (Δ): <span class="text-cyan-300 font-bold">${opt.greeks.delta}</span></div>` : ''}
                                 ${opt.greeks.gamma ? `<div>• Gamma (Γ): <span class="text-cyan-300 font-bold">${opt.greeks.gamma}</span></div>` : ''}
                                 ${opt.greeks.theta ? `<div>• Theta (Θ): <span class="text-emerald-300 font-bold">${opt.greeks.theta}</span></div>` : ''}
@@ -1726,6 +2031,7 @@ def index():
                                 ${opt.risk_metrics.var_95 ? `<div>• 正股 95% VaR: <span class="text-amber-400 font-bold">${opt.risk_metrics.var_95}</span></div>` : ''}
                                 ${opt.risk_metrics.breakeven ? `<div>• 損益平衡點: <span class="text-white font-bold">${opt.risk_metrics.breakeven}</span></div>` : ''}
                                 ${opt.risk_metrics.risk_reward ? `<div>• 理論盈虧比: <span class="text-cyan-300 font-bold">${opt.risk_metrics.risk_reward}</span></div>` : ''}
+                                ${opt.risk_metrics.contract && opt.risk_metrics.contract !== 'N/A' ? `<div>• 參考合約: <span class="text-white font-bold">${opt.risk_metrics.contract}</span></div>` : ''}
                             </div>
                         `;
                     }
@@ -1782,9 +2088,10 @@ def index():
 
                 let modelsHtml = '<div>全自動運算中...</div>';
                 if(p && p.model_list) {
-                    modelsHtml = p.model_list.map(m => `
-                        <div>• <b>${m.name}</b>: $${m.open.toFixed(2)} / $${m.high.toFixed(2)} / $${m.low.toFixed(2)}</div>
-                    `).join('');
+                    modelsHtml = p.model_list.map(m => {
+                        const w = (m.weight != null) ? ` <span class="text-cyan-400">[${m.weight}%]</span>` : '';
+                        return `<div>• <b>${m.name}</b>${w}: $${Number(m.open).toFixed(2)} / $${Number(m.high).toFixed(2)} / $${Number(m.low).toFixed(2)}</div>`;
+                    }).join('');
                 }
 
                 let historyHtml = (item.history_logs || []).map(h => {
@@ -1877,11 +2184,12 @@ def index():
                                 <div>• 預估最高：<b>$${p.pred_high.toFixed(2)}</b></div>
                                 <div>• 預估最低：<b>$${p.pred_low.toFixed(2)}</b></div>
                                 <div>• 信心度：${p.confidence}</div>
+                                ${p.weighted ? '<div class="text-[10px] text-gray-500">• 集成方式：歷史 MAE 反比加權（結算後自動更新）</div>' : ''}
                             </div>
                         </div>
 
                         <div class="space-y-1">
-                            <div class="text-xs font-bold text-gray-400">🤖 13 大 AI 模型預測明細 (共 ${p.model_list ? p.model_list.length : 13} 個)：</div>
+                            <div class="text-xs font-bold text-gray-400">🤖 13 大 AI 模型預測明細（依權重排序，共 ${p.model_list ? p.model_list.length : 13} 個）：</div>
                             <div class="block-bg rounded-lg p-3 text-[11px] text-gray-300 grid grid-cols-1 gap-1 max-h-36 overflow-y-auto font-mono">
                                 ${modelsHtml}
                             </div>
