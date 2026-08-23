@@ -1433,7 +1433,7 @@ def trigger_test_alert():
 
 
 # ----------------------------------------------------------------------
-# 網頁控制台前端 (已全面支援 BSM Greeks、壓力測試與決策除錯 UI)
+# 網頁控制台前端 (已全面支援 BSM Greeks 與壓力測試 UI)
 # ----------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -1466,7 +1466,7 @@ def index():
                     全自動即時連線中
                 </span>
             </div>
-            <p class="text-xs text-gray-400 mt-1">13 大 AI 機器學習模型全自動持續更新 + BSM 期權風險量化引擎 (Greeks / PoP / Stress Test) · 決策除錯可見</p>
+            <p class="text-xs text-gray-400 mt-1">13 大 AI 機器學習模型全自動持續更新 + BSM 期權風險量化引擎 (Greeks / PoP / Stress Test)</p>
         </div>
         <div class="flex items-center gap-2">
             <input type="text" id="stockInput" placeholder="輸入代碼 (例: 3466.HK, NVDA)"
@@ -1761,23 +1761,6 @@ def index():
                         `;
                     }
 
-                    // Decision debug block – makes Mac vs GitHub difference transparent
-                    let debugHtml = '';
-                    if(opt.debug) {
-                        const d = opt.debug;
-                        debugHtml = `
-                            <div class="mt-2 pt-2 border-t border-purple-900/40 text-[10px] text-gray-400 space-y-0.5 font-mono">
-                                <div class="text-purple-300 font-bold">🔍 決策除錯 (Debug Gate)：</div>
-                                <div>• gate = <span class="text-amber-300">${d.gate || 'N/A'}</span></div>
-                                <div>• score = ${d.score} (bull≥${d.score_strong_bull}, floor≥${d.score_neutral_floor})</div>
-                                <div>• has_near_earnings = ${d.has_near_earnings} ${d.earnings_days_left != null ? '(剩餘 ' + d.earnings_days_left + ' 天)' : ''}</div>
-                                <div>• is_high_volatile = ${d.is_high_volatile} (振幅 ${d.shock_72h_pct}% / 漲跌 ${d.roc_72h_pct}%)</div>
-                                <div>• has_options = ${d.has_options} (source: ${d.options_source || 'n/a'}) | df_len = ${d.df_len}</div>
-                                <div>• detail: ${d.reason_detail || '-'}</div>
-                            </div>
-                        `;
-                    }
-
                     optionsHtml = `
                         <div class="space-y-1">
                             <div class="text-xs font-bold text-purple-400 flex items-center gap-1">
@@ -1792,7 +1775,6 @@ def index():
                                 ${greeksHtml}
                                 ${riskMetricsHtml}
                                 ${stressTestHtml}
-                                ${debugHtml}
                             </div>
                         </div>
                     `;
