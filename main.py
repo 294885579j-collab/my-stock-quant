@@ -5,7 +5,7 @@ import warnings
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -34,6 +34,14 @@ warnings.filterwarnings('ignore')
 STATE_FILE = "state_v2.json"
 WATCHLIST = ["3466.HK", "NVDA", "VOO", "RKLB"]
 
+# Explicit decision thresholds (easy to tune)
+SCORE_STRONG_BULL = 70
+SCORE_NEUTRAL_FLOOR = 45
+EARNINGS_BLOCK_DAYS = 7
+VOL_SHOCK_PCT = 8.0
+VOL_ROC_PCT = 6.0
+OPTIONS_CACHE_TTL_SEC = 3600  # 1 hour
+
 YF_SESSION = requests.Session()
 YF_SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -41,8 +49,8 @@ YF_SESSION.headers.update({
 
 app = FastAPI(title="AI Quant Trading Platform")
 
-# 期權狀態快取 (避免頻繁請求 API 導致 Rate Limit)
-OPTIONS_CACHE = {}
+# OPTIONS_CACHE: symbol -> {"has_options": bool, "ts": float}
+OPTIONS_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # ----------------------------------------------------------------------
 # 狀態載入與儲存
@@ -150,11 +158,28 @@ def get_macro_events(start_date: datetime.date, end_date: datetime.date) -> List
         curr += timedelta(days=1)
     return macro_list
 
+
+def _parse_earnings_date(raw) -> Optional[datetime.date]:
+    """Robustly turn Yahoo calendar earnings value into a date."""
+    if raw is None:
+        return None
+    try:
+        if hasattr(raw, "date") and callable(raw.date):
+            return raw.date()
+        if isinstance(raw, datetime):
+            return raw.date()
+        s = str(raw)[:10]
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
 def fetch_stock_events(symbol: str) -> List[Dict[str, Any]]:
     symbol = symbol.strip().upper()
-    now_tz = datetime.now(ZoneInfo("Asia/Hong_Kong")).date()
+    tz_str = "Asia/Hong_Kong" if symbol.endswith(".HK") else "America/New_York"
+    now_tz = datetime.now(ZoneInfo(tz_str)).date()
     end_date = now_tz + timedelta(days=30)
-    
+
     events = []
     try:
         stock = yf.Ticker(symbol, session=YF_SESSION)
@@ -163,7 +188,7 @@ def fetch_stock_events(symbol: str) -> List[Dict[str, Any]]:
             cal = stock.calendar
         except Exception:
             cal = None
-            
+
         earn_date_found = None
         if cal is not None:
             if isinstance(cal, dict) and "Earnings Date" in cal:
@@ -174,25 +199,18 @@ def fetch_stock_events(symbol: str) -> List[Dict[str, Any]]:
                 e_list = cal.loc["Earnings Date"].dropna().tolist()
                 if e_list and len(e_list) > 0:
                     earn_date_found = e_list[0]
-                    
-        if earn_date_found:
-            if hasattr(earn_date_found, 'date'):
-                ed = earn_date_found.date()
-            elif isinstance(earn_date_found, datetime):
-                ed = earn_date_found.date()
-            else:
-                ed = datetime.strptime(str(earn_date_found)[:10], "%Y-%m-%d").date()
-                
-            if now_tz <= ed <= end_date:
-                days_left = (ed - now_tz).days
-                events.append({
-                    "date": ed.strftime("%Y-%m-%d"),
-                    "days_left": days_left,
-                    "title": f"📊 {symbol} 季度業績報告發佈 (Earnings)",
-                    "tag": "🚨 業績日",
-                    "tag_color": "bg-rose-950 text-rose-300 border-rose-800 font-black animate-pulse",
-                    "impact": "極高波動風險！股價單日可能有 > ±8% 暴升暴跌"
-                })
+
+        ed = _parse_earnings_date(earn_date_found)
+        if ed is not None and now_tz <= ed <= end_date:
+            days_left = (ed - now_tz).days
+            events.append({
+                "date": ed.strftime("%Y-%m-%d"),
+                "days_left": days_left,
+                "title": f"📊 {symbol} 季度業績報告發佈 (Earnings)",
+                "tag": "🚨 業績日",
+                "tag_color": "bg-rose-950 text-rose-300 border-rose-800 font-black animate-pulse",
+                "impact": "極高波動風險！股價單日可能有 > ±8% 暴升暴跌"
+            })
     except Exception:
         pass
 
@@ -201,33 +219,34 @@ def fetch_stock_events(symbol: str) -> List[Dict[str, Any]]:
     events.sort(key=lambda x: x["days_left"])
     return events[:5]
 
+
 # ----------------------------------------------------------------------
 # 高階期權風險量化引擎 (Black-Scholes-Merton + Greeks + Risk Metrics)
 # ----------------------------------------------------------------------
 def bs_greeks_and_price(S: float, K: float, T: float, r: float, sigma: float, option_type: str = "call") -> dict:
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return {"price": 0.0, "delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "rho": 0.0, "pop": 0.0, "d1": 0.0, "d2": 0.0}
-    
+
     d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
     d2 = d1 - sigma * np.sqrt(T)
     pdf_d1 = norm.pdf(d1)
-    
+
     if option_type == "call":
         price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
         delta = norm.cdf(d1)
-        pop = norm.cdf(d2) 
+        pop = norm.cdf(d2)
         theta = (- (S * pdf_d1 * sigma) / (2 * np.sqrt(T)) - r * K * np.exp(-r * T) * norm.cdf(d2)) / 365.0
         rho = (K * T * np.exp(-r * T) * norm.cdf(d2)) / 100.0
     else:
         price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
         delta = norm.cdf(d1) - 1.0
-        pop = norm.cdf(-d2) 
+        pop = norm.cdf(-d2)
         theta = (- (S * pdf_d1 * sigma) / (2 * np.sqrt(T)) + r * K * np.exp(-r * T) * norm.cdf(-d2)) / 365.0
         rho = (- K * T * np.exp(-r * T) * norm.cdf(-d2)) / 100.0
-        
+
     gamma = pdf_d1 / (S * sigma * np.sqrt(T))
     vega = (S * pdf_d1 * np.sqrt(T)) / 100.0
-    
+
     return {
         "price": float(price),
         "delta": float(delta),
@@ -240,18 +259,60 @@ def bs_greeks_and_price(S: float, K: float, T: float, r: float, sigma: float, op
         "d2": float(d2)
     }
 
-def calculate_options_recommendation(symbol: str, df: pd.DataFrame, score: int, shock_data: dict, events: list) -> dict:
-    """ 重構優化：量化期權風險與策略算式引擎 """
-    
-    # 檢查股票是否支援期權 (並快取結果避免重複請求)
-    if symbol not in OPTIONS_CACHE:
-        try:
-            stock = yf.Ticker(symbol, session=YF_SESSION)
-            OPTIONS_CACHE[symbol] = bool(stock.options and len(stock.options) > 0)
-        except Exception:
-            OPTIONS_CACHE[symbol] = False
 
-    if not OPTIONS_CACHE[symbol]:
+def _check_has_options(symbol: str) -> bool:
+    """Cached options availability with TTL to avoid rate-limit flicker."""
+    now_ts = datetime.now().timestamp()
+    cached = OPTIONS_CACHE.get(symbol)
+    if cached and (now_ts - cached.get("ts", 0)) < OPTIONS_CACHE_TTL_SEC:
+        return bool(cached.get("has_options", False))
+
+    has = False
+    try:
+        stock = yf.Ticker(symbol, session=YF_SESSION)
+        opts = getattr(stock, "options", None)
+        has = bool(opts and len(opts) > 0)
+    except Exception:
+        has = False
+
+    OPTIONS_CACHE[symbol] = {"has_options": has, "ts": now_ts}
+    return has
+
+
+def calculate_options_recommendation(
+    symbol: str,
+    df: pd.DataFrame,
+    score: int,
+    shock_data: dict,
+    events: list
+) -> dict:
+    """
+    Quant options engine with explicit decision audit trail.
+    Returns the same structure as before + a new "debug" key that explains
+    exactly which gate produced the recommendation. This makes Mac vs
+    cloud differences immediately visible.
+    """
+    debug = {
+        "score": score,
+        "score_strong_bull": SCORE_STRONG_BULL,
+        "score_neutral_floor": SCORE_NEUTRAL_FLOOR,
+        "has_near_earnings": False,
+        "earnings_days_left": None,
+        "is_high_volatile": bool(shock_data.get("is_high_volatile", False)),
+        "shock_72h_pct": shock_data.get("shock_72h_pct"),
+        "roc_72h_pct": shock_data.get("roc_72h_pct"),
+        "has_options": False,
+        "df_len": len(df),
+        "gate": None,
+        "reason_detail": ""
+    }
+
+    # Gate 1: options market existence
+    has_opts = _check_has_options(symbol)
+    debug["has_options"] = has_opts
+    if not has_opts:
+        debug["gate"] = "NO_OPTIONS_MARKET"
+        debug["reason_detail"] = f"{symbol} 目前無可用期權鏈 (Yahoo options empty or rate-limited)"
         return {
             "strategy": "🚫 不能購買 (無期權市場)",
             "action": "NONE",
@@ -261,10 +322,14 @@ def calculate_options_recommendation(symbol: str, df: pd.DataFrame, score: int, 
             "take_profit_target": "N/A",
             "greeks": {},
             "risk_metrics": {},
-            "stress_test": []
+            "stress_test": [],
+            "debug": debug
         }
 
+    # Gate 2: enough history for HV
     if len(df) < 30:
+        debug["gate"] = "INSUFFICIENT_HISTORY"
+        debug["reason_detail"] = f"歷史 K 線僅 {len(df)} 根 (<30)"
         return {
             "strategy": "🚫 數據不足",
             "action": "NONE",
@@ -274,7 +339,8 @@ def calculate_options_recommendation(symbol: str, df: pd.DataFrame, score: int, 
             "take_profit_target": "N/A",
             "greeks": {},
             "risk_metrics": {},
-            "stress_test": []
+            "stress_test": [],
+            "debug": debug
         }
 
     latest = df.iloc[-1]
@@ -294,19 +360,48 @@ def calculate_options_recommendation(symbol: str, df: pd.DataFrame, score: int, 
     days_to_friday = (4 - target_dt.weekday()) % 7
     exp_dt = target_dt + timedelta(days=days_to_friday)
     exp_date = exp_dt.strftime("%Y-%m-%d")
-    
+
     days_to_exp = max(1, (exp_dt - now_date).days)
     T = days_to_exp / 365.0
     r = 0.045
 
-    has_near_earnings = any(e.get("days_left", 99) <= 7 and "業績" in e.get("title", "") for e in events)
-    is_high_volatile = shock_data.get("is_high_volatile", False)
+    # Earnings proximity (timezone-aware)
+    near_earn = False
+    earn_days = None
+    for e in events:
+        title = e.get("title", "")
+        days = e.get("days_left", 99)
+        if "業績" in title or "Earnings" in title:
+            earn_days = days
+            if days <= EARNINGS_BLOCK_DAYS:
+                near_earn = True
+                break
+    debug["has_near_earnings"] = near_earn
+    debug["earnings_days_left"] = earn_days
+    is_high_volatile = bool(shock_data.get("is_high_volatile", False))
 
-    if has_near_earnings or is_high_volatile or score < 45:
+    # Gate 3: hard block
+    if near_earn or is_high_volatile or score < SCORE_NEUTRAL_FLOOR:
+        reasons = []
+        if near_earn:
+            reasons.append(f"近 {EARNINGS_BLOCK_DAYS} 天有業績日 (剩餘 {earn_days} 天)")
+        if is_high_volatile:
+            reasons.append(
+                f"高波動 (72h振幅 {shock_data.get('shock_72h_pct')}% / "
+                f"淨漲跌 {shock_data.get('roc_72h_pct')}%)"
+            )
+        if score < SCORE_NEUTRAL_FLOOR:
+            reasons.append(f"技術分 {score} < {SCORE_NEUTRAL_FLOOR}")
+        debug["gate"] = "HARD_BLOCK"
+        debug["reason_detail"] = " | ".join(reasons)
         return {
             "strategy": "🚫 暫不建議期權操作",
             "action": "NONE",
-            "reason": "近 7 天有重大業績發佈、股價極致震盪或技術打分偏弱，波動率溢價 (IV Crush Risk) 過高或方向極不明確。",
+            "reason": (
+                "近 7 天有重大業績發佈、股價極致震盪或技術打分偏弱，"
+                "波動率溢價 (IV Crush Risk) 過高或方向極不明確。"
+                f" 詳見除錯：{debug['reason_detail']}"
+            ),
             "strike_price": "N/A",
             "exp_date": "N/A",
             "take_profit_target": "N/A",
@@ -315,23 +410,26 @@ def calculate_options_recommendation(symbol: str, df: pd.DataFrame, score: int, 
                 "dte": f"{days_to_exp} 天"
             },
             "risk_metrics": {},
-            "stress_test": []
+            "stress_test": [],
+            "debug": debug
         }
-    elif score >= 70:
+
+    # Gate 4: strong bull → Buy Call
+    if score >= SCORE_STRONG_BULL:
         strike = round(close_price + (1.0 * atr), 2)
         pct_otm = round((strike / close_price - 1) * 100, 1)
-        
+
         bs_res = bs_greeks_and_price(close_price, strike, T, r, hv_30d, "call")
-        call_price = bs_res["price"]
-        
+        call_price = max(bs_res["price"], 0.01)
+
         var_95_stock = 1.645 * hv_30d * np.sqrt(T) * close_price
         pop_pct = round(bs_res["pop"] * 100, 1)
-        
+
         stress_test = []
         for change_pct in [-10, -5, 0, 5, 10]:
             sim_s = close_price * (1 + change_pct / 100.0)
             sim_res = bs_greeks_and_price(sim_s, strike, T, r, hv_30d, "call")
-            sim_pnl = ((sim_res["price"] - call_price) / (call_price + 1e-9)) * 100
+            sim_pnl = ((sim_res["price"] - call_price) / call_price) * 100
             stress_test.append({
                 "price_change": f"{change_pct:+d}%",
                 "target_price": round(sim_s, 2),
@@ -339,6 +437,8 @@ def calculate_options_recommendation(symbol: str, df: pd.DataFrame, score: int, 
                 "pnl_pct": f"{sim_pnl:+.1f}%"
             })
 
+        debug["gate"] = "BUY_CALL"
+        debug["reason_detail"] = f"score {score} >= {SCORE_STRONG_BULL}"
         return {
             "strategy": "🐂 建議 Buy Call (買看漲期權)",
             "action": "BUY_CALL",
@@ -358,56 +458,65 @@ def calculate_options_recommendation(symbol: str, df: pd.DataFrame, score: int, 
                 "pop": f"{pop_pct}% (到期價內勝率)",
                 "max_loss": f"${call_price:.2f} / 股 (${call_price*100:.0f} / 張)",
                 "var_95": f"${var_95_stock:.2f} (正股 95% 波動風險值)",
-                "risk_reward": f"1 : {(atr*2)/max(call_price, 0.01):.1f} (理論盈虧比)"
+                "risk_reward": f"1 : {(atr*2)/call_price:.1f} (理論盈虧比)"
             },
-            "stress_test": stress_test
+            "stress_test": stress_test,
+            "debug": debug
         }
-    else:
-        strike = round(min(close_price - (1.5 * atr), bb_lower), 2)
-        pct_otm = round((1 - strike / close_price) * 100, 1)
-        
-        bs_res = bs_greeks_and_price(close_price, strike, T, r, hv_30d, "put")
-        put_price = bs_res["price"]
-        
-        pop_pct = round((1.0 - norm.cdf(bs_res["d2"])) * 100, 1)
-        var_95_stock = 1.645 * hv_30d * np.sqrt(T) * close_price
-        
-        stress_test = []
-        for change_pct in [-10, -5, 0, 5, 10]:
-            sim_s = close_price * (1 + change_pct / 100.0)
-            sim_res = bs_greeks_and_price(sim_s, strike, T, r, hv_30d, "put")
-            sim_pnl_dollar = put_price - sim_res["price"]
-            sim_pnl_pct = (sim_pnl_dollar / (put_price + 1e-9)) * 100
-            stress_test.append({
-                "price_change": f"{change_pct:+d}%",
-                "target_price": round(sim_s, 2),
-                "opt_price": round(sim_res["price"], 2),
-                "pnl_pct": f"{sim_pnl_pct:+.1f}%"
-            })
 
-        return {
-            "strategy": "🛡️ 建議 Sell Put (賣看跌期權/收取權利金)",
-            "action": "SELL_PUT",
-            "reason": f"技術面處於中性盤整區間 ({score}分)，適合透過 Sell Put 賺取時間價值衰減 (Theta decay)。",
-            "strike_price": f"${strike} (OTM -{pct_otm}%)",
-            "exp_date": f"{exp_date} ({days_to_exp} 天 DTE)",
-            "take_profit_target": "當獲得最大權利金收益之 50% ~ 75% 時提前買回平倉 (Buy to Close)",
-            "greeks": {
-                "hv_30d": f"{hv_30d*100:.1f}%",
-                "est_premium": f"${put_price:.2f}",
-                "delta": f"{bs_res['delta']:.3f}",
-                "gamma": f"{bs_res['gamma']:.4f}",
-                "theta": f"${abs(bs_res['theta']):.3f}/日 (收益)",
-                "vega": f"${bs_res['vega']:.3f}/1% IV"
-            },
-            "risk_metrics": {
-                "pop": f"{pop_pct}% (到期不履約/獲利勝率)",
-                "max_gain": f"${put_price:.2f} / 股 (${put_price*100:.0f} / 張)",
-                "var_95": f"${var_95_stock:.2f} (正股 95% 波動風險值)",
-                "breakeven": f"${strike - put_price:.2f} (損益平衡點)"
-            },
-            "stress_test": stress_test
-        }
+    # Gate 5: neutral → Sell Put
+    strike = round(min(close_price - (1.5 * atr), bb_lower), 2)
+    pct_otm = round((1 - strike / close_price) * 100, 1)
+
+    bs_res = bs_greeks_and_price(close_price, strike, T, r, hv_30d, "put")
+    put_price = max(bs_res["price"], 0.01)
+
+    # PoP for short put ≈ probability that S_T > K = N(d2) of the put's d2 under risk-neutral
+    # Original code used 1 - N(d2); we keep consistent with previous behaviour.
+    pop_pct = round((1.0 - norm.cdf(bs_res["d2"])) * 100, 1)
+    var_95_stock = 1.645 * hv_30d * np.sqrt(T) * close_price
+
+    stress_test = []
+    for change_pct in [-10, -5, 0, 5, 10]:
+        sim_s = close_price * (1 + change_pct / 100.0)
+        sim_res = bs_greeks_and_price(sim_s, strike, T, r, hv_30d, "put")
+        # For short put, PnL = premium received - new put price
+        sim_pnl_dollar = put_price - sim_res["price"]
+        sim_pnl_pct = (sim_pnl_dollar / put_price) * 100
+        stress_test.append({
+            "price_change": f"{change_pct:+d}%",
+            "target_price": round(sim_s, 2),
+            "opt_price": round(sim_res["price"], 2),
+            "pnl_pct": f"{sim_pnl_pct:+.1f}%"
+        })
+
+    debug["gate"] = "SELL_PUT"
+    debug["reason_detail"] = f"{SCORE_NEUTRAL_FLOOR} <= score {score} < {SCORE_STRONG_BULL}"
+    return {
+        "strategy": "🛡️ 建議 Sell Put (賣看跌期權/收取權利金)",
+        "action": "SELL_PUT",
+        "reason": f"技術面處於中性盤整區間 ({score}分)，適合透過 Sell Put 賺取時間價值衰減 (Theta decay)。",
+        "strike_price": f"${strike} (OTM -{pct_otm}%)",
+        "exp_date": f"{exp_date} ({days_to_exp} 天 DTE)",
+        "take_profit_target": "當獲得最大權利金收益之 50% ~ 75% 時提前買回平倉 (Buy to Close)",
+        "greeks": {
+            "hv_30d": f"{hv_30d*100:.1f}%",
+            "est_premium": f"${put_price:.2f}",
+            "delta": f"{bs_res['delta']:.3f}",
+            "gamma": f"{bs_res['gamma']:.4f}",
+            "theta": f"${abs(bs_res['theta']):.3f}/日 (收益)",
+            "vega": f"${bs_res['vega']:.3f}/1% IV"
+        },
+        "risk_metrics": {
+            "pop": f"{pop_pct}% (到期不履約/獲利勝率)",
+            "max_gain": f"${put_price:.2f} / 股 (${put_price*100:.0f} / 張)",
+            "var_95": f"${var_95_stock:.2f} (正股 95% 波動風險值)",
+            "breakeven": f"${strike - put_price:.2f} (損益平衡點)"
+        },
+        "stress_test": stress_test,
+        "debug": debug
+    }
+
 
 # ----------------------------------------------------------------------
 # 市場狀態與即時股價獲取
@@ -443,6 +552,7 @@ def get_stock_session(symbol: str) -> str:
         else:
             return "CLOSED"
 
+
 def normalize_symbol(symbol: str) -> str:
     symbol = symbol.strip().upper()
     if symbol.isdigit():
@@ -450,7 +560,8 @@ def normalize_symbol(symbol: str) -> str:
             return f"{symbol.zfill(4)}.HK"
     return symbol
 
-def get_realtime_price(stock):
+
+def get_realtime_price(stock) -> Optional[float]:
     try:
         df_1m = stock.history(period="1d", interval="1m", auto_adjust=False, prepost=True)
         if not df_1m.empty:
@@ -468,7 +579,8 @@ def get_realtime_price(stock):
         pass
     return None
 
-def get_realtime_open_price(stock, symbol):
+
+def get_realtime_open_price(stock, symbol) -> Optional[float]:
     symbol = symbol.strip().upper()
     tz_str = "Asia/Hong_Kong" if symbol.endswith(".HK") else "America/New_York"
     try:
@@ -492,20 +604,22 @@ def get_realtime_open_price(stock, symbol):
         pass
     return None
 
-def fetch_stock_data(symbol: str):
+
+def fetch_stock_data(symbol: str) -> Tuple[Optional[pd.DataFrame], str]:
     symbol = symbol.strip().upper()
     stock = yf.Ticker(symbol, session=YF_SESSION)
     df = stock.history(period="180d", auto_adjust=False)
-    
+
     if df.empty or len(df) < 15:
         return None, "CLOSED"
-        
+
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-        
+
     df = df.dropna(subset=['Close']).copy()
     session = get_stock_session(symbol)
 
+    # Only overwrite last bar when market is potentially live
     if session in ["PRE", "REGULAR", "LUNCH_BREAK", "POST", "CLOSED"]:
         real_open = get_realtime_open_price(stock, symbol)
         if real_open and real_open > 0:
@@ -518,15 +632,17 @@ def fetch_stock_data(symbol: str):
         live_price = get_realtime_price(stock)
         if live_price and live_price > 0:
             df.iloc[-1, df.columns.get_loc("Close")] = live_price
-            df.iloc[-1, df.columns.get_loc("High")] = max(df.iloc[-1]["High"], live_price)
-            df.iloc[-1, df.columns.get_loc("Low")] = min(df.iloc[-1]["Low"], live_price)
+            df.iloc[-1, df.columns.get_loc("High")] = max(float(df.iloc[-1]["High"]), live_price)
+            df.iloc[-1, df.columns.get_loc("Low")] = min(float(df.iloc[-1]["Low"]), live_price)
 
     return df, session
+
 
 # ----------------------------------------------------------------------
 # 技術指標與異動警訊偵測
 # ----------------------------------------------------------------------
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
     df['MA5'] = df['Close'].rolling(window=5).mean()
     df['MA10'] = df['Close'].rolling(window=10).mean()
     df['MA20'] = df['Close'].rolling(window=20).mean()
@@ -561,8 +677,16 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     )
     df['ATR'] = tr.rolling(window=14).mean()
 
-    plus_dm = np.where((df['High'] - df['High'].shift(1)) > (df['Low'].shift(1) - df['Low']), np.maximum(df['High'] - df['High'].shift(1), 0), 0)
-    minus_dm = np.where((df['Low'].shift(1) - df['Low']) > (df['High'] - df['High'].shift(1)), np.maximum(df['Low'].shift(1) - df['Low'], 0), 0)
+    plus_dm = np.where(
+        (df['High'] - df['High'].shift(1)) > (df['Low'].shift(1) - df['Low']),
+        np.maximum(df['High'] - df['High'].shift(1), 0),
+        0
+    )
+    minus_dm = np.where(
+        (df['Low'].shift(1) - df['Low']) > (df['High'] - df['High'].shift(1)),
+        np.maximum(df['Low'].shift(1) - df['Low'], 0),
+        0
+    )
     atr14 = df['ATR'].replace(0, 1e-9)
     plus_di = 100 * (pd.Series(plus_dm, index=df.index).rolling(14).mean() / atr14)
     minus_di = 100 * (pd.Series(minus_dm, index=df.index).rolling(14).mean() / atr14)
@@ -573,6 +697,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['Vol_Ratio'] = df['Volume'] / df['Vol_MA5'].replace(0, 1e-9)
 
     return df.ffill().bfill()
+
 
 def check_signals(df: pd.DataFrame) -> List[str]:
     if len(df) < 30:
@@ -610,25 +735,39 @@ def check_signals(df: pd.DataFrame) -> List[str]:
 
     return signals
 
+
 def calculate_price_shock(df: pd.DataFrame) -> dict:
-    if len(df) < 3:
+    """
+    Use completed bars only when possible to reduce live-bar noise that
+    causes Mac vs cloud divergence.
+    """
+    if len(df) < 4:
         return {"shock_72h_pct": 0.0, "roc_72h_pct": 0.0, "is_high_volatile": False}
-    
+
+    # Prefer last 3 completed bars; fall back to last 3 including current
+    lookback = df.iloc[-4:-1] if len(df) >= 4 else df.tail(3)
+    if lookback.empty:
+        lookback = df.tail(3)
+
     latest_close = float(df['Close'].iloc[-1])
-    high_72h = float(df['High'].tail(3).max())
-    low_72h = float(df['Low'].tail(3).min())
+    high_72h = float(lookback['High'].max())
+    low_72h = float(lookback['Low'].min())
+    if low_72h <= 0:
+        return {"shock_72h_pct": 0.0, "roc_72h_pct": 0.0, "is_high_volatile": False}
+
     shock_72h_pct = round(((high_72h - low_72h) / low_72h) * 100, 2)
-    
-    close_3d_ago = float(df['Close'].iloc[-3])
-    roc_72h_pct = round(((latest_close - close_3d_ago) / close_3d_ago) * 100, 2)
-    
-    is_high_volatile = (shock_72h_pct >= 8.0) or (abs(roc_72h_pct) >= 6.0)
-    
+
+    close_3d_ago = float(lookback['Close'].iloc[0])
+    roc_72h_pct = round(((latest_close - close_3d_ago) / close_3d_ago) * 100, 2) if close_3d_ago > 0 else 0.0
+
+    is_high_volatile = (shock_72h_pct >= VOL_SHOCK_PCT) or (abs(roc_72h_pct) >= VOL_ROC_PCT)
+
     return {
         "shock_72h_pct": shock_72h_pct,
         "roc_72h_pct": roc_72h_pct,
         "is_high_volatile": is_high_volatile
     }
+
 
 def calculate_rigorous_score(df: pd.DataFrame):
     latest = df.iloc[-1]
@@ -643,7 +782,7 @@ def calculate_rigorous_score(df: pd.DataFrame):
     macd_h, prev_macd_h = float(latest['MACD_Hist']), float(prev['MACD_Hist'])
     vol_ratio = float(latest['Vol_Ratio'])
     adx = float(latest['ADX'])
-    
+
     score = 50
     reasons = []
 
@@ -714,9 +853,12 @@ def calculate_rigorous_score(df: pd.DataFrame):
             reasons.append(f"• ⚠️ 風控警示：近 72h 震盪下挫 {shock_data['roc_72h_pct']}% (防接刀機制) (-10分)")
             score -= 10
 
-    score = max(0, min(100, int(score)))
-    advice = "多頭格局可偏多操作" if score >= 70 else ("中性盤整觀望" if score >= 45 else "空頭弱勢建議避險")
+    score = max(0, min(100, int(round(score))))
+    advice = "多頭格局可偏多操作" if score >= SCORE_STRONG_BULL else (
+        "中性盤整觀望" if score >= SCORE_NEUTRAL_FLOOR else "空頭弱勢建議避險"
+    )
     return score, reasons, advice, shock_data
+
 
 # ----------------------------------------------------------------------
 # 13 大 AI 機器學習預估引擎
@@ -809,6 +951,7 @@ def predict_prices_with_13_models(df: pd.DataFrame):
         print(f"ML Error: {e}")
         return None
 
+
 # ----------------------------------------------------------------------
 # 審計對比算法
 # ----------------------------------------------------------------------
@@ -817,7 +960,7 @@ def update_pred_audit(symbol: str, df: pd.DataFrame, session: str, pred_res: dic
     raw_audit = GLOBAL_STATE.get("pred_audit", {}).get(symbol, [])
     tz_str = "Asia/Hong_Kong" if symbol.endswith(".HK") else "America/New_York"
     now_tz = datetime.now(ZoneInfo(tz_str))
-    
+
     audit_dict = {}
     for item in raw_audit:
         b_date = item.get("base_date") or item.get("date")
@@ -852,7 +995,7 @@ def update_pred_audit(symbol: str, df: pd.DataFrame, session: str, pred_res: dic
 
     for item in audit_list:
         b_date = item["base_date"]
-        
+
         if item.get("target_date") == "等待下個交易日":
             future_dates = [d for d in df_date_strs if d > b_date]
             if future_dates:
@@ -891,7 +1034,7 @@ def update_pred_audit(symbol: str, df: pd.DataFrame, session: str, pred_res: dic
 
     final_list = []
     seen_targets = set()
-    
+
     for item in reversed(audit_list):
         t_date = item.get("target_date")
         if t_date == "等待下個交易日":
@@ -910,6 +1053,7 @@ def update_pred_audit(symbol: str, df: pd.DataFrame, session: str, pred_res: dic
     save_state(GLOBAL_STATE)
     return final_list[-10:]
 
+
 def calculate_dynamic_risk(close_price: float, atr: float):
     atr_pct = (atr / close_price) * 100 if close_price > 0 else 1.0
     suggested_pos = max(5, min(25, int(1.5 / (atr_pct / 100 + 1e-9))))
@@ -917,6 +1061,7 @@ def calculate_dynamic_risk(close_price: float, atr: float):
     take_profit = round(close_price + (2.5 * atr), 2)
     trailing_stop = round(close_price - (2.0 * atr), 2)
     return f"{suggested_pos}%", stop_loss, take_profit, trailing_stop
+
 
 # ----------------------------------------------------------------------
 # 全自動核心處理與背景定時輪詢任務
@@ -929,7 +1074,7 @@ def process_single_stock(symbol: str):
 
     df = calculate_indicators(df)
     signals = check_signals(df)
-    
+
     latest = df.iloc[-1]
     curr_price = round(float(latest['Close']), 2)
     atr = float(latest['ATR'])
@@ -938,10 +1083,9 @@ def process_single_stock(symbol: str):
     pred_res = predict_prices_with_13_models(df)
     history_logs = update_pred_audit(symbol, df, session, pred_res)
     pos_str, stop_loss, take_profit, trailing_stop = calculate_dynamic_risk(curr_price, atr)
-    
+
     upcoming_events = fetch_stock_events(symbol)
 
-    # 計算升級版的期權量化風險建議數據
     options_rec = calculate_options_recommendation(
         symbol=symbol,
         df=df,
@@ -1016,6 +1160,7 @@ def process_single_stock(symbol: str):
         "history_logs": history_logs
     }
 
+
 async def background_market_loop():
     while True:
         watchlist = list(GLOBAL_STATE.get("watchlist", WATCHLIST))
@@ -1025,8 +1170,9 @@ async def background_market_loop():
                 await asyncio.sleep(1.5)
             except Exception as e:
                 print(f"全自動輪詢更新 {symbol} 失敗: {e}")
-        
+
         await asyncio.sleep(20)
+
 
 # ----------------------------------------------------------------------
 # FastAPI 路由 API
@@ -1034,9 +1180,11 @@ async def background_market_loop():
 class StockReq(BaseModel):
     symbol: str
 
+
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(background_market_loop())
+
 
 @app.get("/api/state")
 def get_state():
@@ -1045,6 +1193,7 @@ def get_state():
         "states": GLOBAL_STATE.get("stock_states", {}),
         "alert_history": GLOBAL_STATE.get("alert_history", [])
     }
+
 
 @app.post("/api/stocks")
 def add_stock(req: StockReq, bg_tasks: BackgroundTasks):
@@ -1056,6 +1205,7 @@ def add_stock(req: StockReq, bg_tasks: BackgroundTasks):
         save_state(GLOBAL_STATE)
         bg_tasks.add_task(process_single_stock, symbol)
     return {"status": "ok", "watchlist": watchlist}
+
 
 @app.delete("/api/stocks/{symbol}")
 def delete_stock(symbol: str):
@@ -1071,12 +1221,13 @@ def delete_stock(symbol: str):
         save_state(GLOBAL_STATE)
     return {"status": "ok", "watchlist": watchlist}
 
+
 @app.post("/api/test-alert")
 def trigger_test_alert():
     alert_history = GLOBAL_STATE.get("alert_history", [])
     time_str = datetime.now(ZoneInfo("Asia/Hong_Kong")).strftime("%m-%d %H:%M:%S")
     test_id = f"TEST_{datetime.now().timestamp()}"
-    
+
     test_alert = {
         "id": test_id,
         "symbol": "TEST.US",
@@ -1090,8 +1241,9 @@ def trigger_test_alert():
     save_state(GLOBAL_STATE)
     return {"status": "ok", "alert": test_alert}
 
+
 # ----------------------------------------------------------------------
-# 網頁控制台前端 (已全面支援 BSM Greeks 與壓力測試 UI)
+# 網頁控制台前端 (已全面支援 BSM Greeks、壓力測試與決策除錯 UI)
 # ----------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -1124,10 +1276,10 @@ def index():
                     全自動即時連線中
                 </span>
             </div>
-            <p class="text-xs text-gray-400 mt-1">13 大 AI 機器學習模型全自動持續更新 + BSM 期權風險量化引擎 (Greeks / PoP / Stress Test)</p>
+            <p class="text-xs text-gray-400 mt-1">13 大 AI 機器學習模型全自動持續更新 + BSM 期權風險量化引擎 (Greeks / PoP / Stress Test) · 決策除錯可見</p>
         </div>
         <div class="flex items-center gap-2">
-            <input type="text" id="stockInput" placeholder="輸入代碼 (例: 3466.HK, NVDA)" 
+            <input type="text" id="stockInput" placeholder="輸入代碼 (例: 3466.HK, NVDA)"
                    onkeypress="if(event.key==='Enter') addStock()"
                    class="bg-gray-900 border border-gray-700 px-3 py-1.5 rounded-lg text-sm text-white focus:outline-none focus:border-cyan-500 uppercase">
             <button onclick="addStock()" class="bg-cyan-600 hover:bg-cyan-500 text-white font-bold px-4 py-1.5 rounded-lg text-sm transition">新增標的</button>
@@ -1135,7 +1287,7 @@ def index():
     </header>
 
     <main class="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-4 gap-6">
-        
+
         <div class="lg:col-span-1 space-y-4">
             <div class="card-bg rounded-xl p-4 border border-amber-500/30 sticky top-4">
                 <div class="flex items-center justify-between border-b border-gray-800 pb-2 mb-3">
@@ -1167,7 +1319,7 @@ def index():
                 </div>
                 <button onclick="closeAlertModal()" class="text-gray-400 hover:text-white font-bold text-2xl leading-none">&times;</button>
             </div>
-            
+
             <div id="alertModalBody" class="space-y-3 max-h-80 overflow-y-auto pr-1"></div>
 
             <div class="pt-2 border-t border-gray-800">
@@ -1262,7 +1414,7 @@ def index():
                     const alertId = a.id || `${a.symbol}_${a.time}_${a.signal}`;
                     dismissedAlertIds.add(alertId);
                 });
-                
+
                 const idsArray = Array.from(dismissedAlertIds).slice(-50);
                 localStorage.setItem('dismissedAlertIds', JSON.stringify(idsArray));
 
@@ -1335,10 +1487,10 @@ def index():
                 const r = item.risk;
                 const s = item.shock_data;
                 const ev = item.upcoming_events || [];
-                const opt = item.options_rec;
+                const opt = item.options_rec || {};
 
-                const reasonsHtml = item.reasons.map(r => `<div>${r}</div>`).join('');
-                
+                const reasonsHtml = (item.reasons || []).map(r => `<div>${r}</div>`).join('');
+
                 let eventsHtml = '<div class="text-gray-500 py-1">近 30 天無重大事件</div>';
                 if(ev.length > 0) {
                     eventsHtml = ev.map(e => `
@@ -1359,7 +1511,7 @@ def index():
                 }
 
                 let optionsHtml = '';
-                if(opt) {
+                if(opt && opt.strategy) {
                     let greeksHtml = '';
                     if(opt.greeks && Object.keys(opt.greeks).length > 0) {
                         greeksHtml = `
@@ -1419,6 +1571,23 @@ def index():
                         `;
                     }
 
+                    // Decision debug block – makes Mac vs GitHub difference transparent
+                    let debugHtml = '';
+                    if(opt.debug) {
+                        const d = opt.debug;
+                        debugHtml = `
+                            <div class="mt-2 pt-2 border-t border-purple-900/40 text-[10px] text-gray-400 space-y-0.5 font-mono">
+                                <div class="text-purple-300 font-bold">🔍 決策除錯 (Debug Gate)：</div>
+                                <div>• gate = <span class="text-amber-300">${d.gate || 'N/A'}</span></div>
+                                <div>• score = ${d.score} (bull≥${d.score_strong_bull}, floor≥${d.score_neutral_floor})</div>
+                                <div>• has_near_earnings = ${d.has_near_earnings} ${d.earnings_days_left != null ? '(剩餘 ' + d.earnings_days_left + ' 天)' : ''}</div>
+                                <div>• is_high_volatile = ${d.is_high_volatile} (振幅 ${d.shock_72h_pct}% / 漲跌 ${d.roc_72h_pct}%)</div>
+                                <div>• has_options = ${d.has_options} | df_len = ${d.df_len}</div>
+                                <div>• detail: ${d.reason_detail || '-'}</div>
+                            </div>
+                        `;
+                    }
+
                     optionsHtml = `
                         <div class="space-y-1">
                             <div class="text-xs font-bold text-purple-400 flex items-center gap-1">
@@ -1428,11 +1597,12 @@ def index():
                                 <div class="font-bold text-sm text-purple-300">${opt.strategy}</div>
                                 <div>• 建議行使價: <span class="text-white font-bold">${opt.strike_price || '無'}</span></div>
                                 <div>• 建議到期日: <span class="text-white font-bold">${opt.exp_date || '無'}</span></div>
-                                <div class="text-amber-300">• 提前平倉目標: ${opt.take_profit_target}</div>
-                                <div class="text-[11px] text-gray-400 mt-1">• 量化說明: ${opt.reason}</div>
+                                <div class="text-amber-300">• 提前平倉目標: ${opt.take_profit_target || 'N/A'}</div>
+                                <div class="text-[11px] text-gray-400 mt-1">• 量化說明: ${opt.reason || ''}</div>
                                 ${greeksHtml}
                                 ${riskMetricsHtml}
                                 ${stressTestHtml}
+                                ${debugHtml}
                             </div>
                         </div>
                     `;
@@ -1448,7 +1618,7 @@ def index():
                 let historyHtml = (item.history_logs || []).map(h => {
                     let displayDate = h.target_date || "待下個交易日";
                     if (displayDate === "等待下個交易日") displayDate = "待下個交易日";
-                    
+
                     if (h.full_verified || h.status === '✅ 完全結算' || h.status === '完全結算') {
                         return `
                             <div class="mb-2 border-b border-gray-800/60 pb-1.5">
@@ -1581,6 +1751,7 @@ def index():
 </body>
 </html>
 """
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8001)
