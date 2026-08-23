@@ -40,7 +40,10 @@ SCORE_NEUTRAL_FLOOR = 45
 EARNINGS_BLOCK_DAYS = 7
 VOL_SHOCK_PCT = 8.0
 VOL_ROC_PCT = 6.0
-OPTIONS_CACHE_TTL_SEC = 3600  # 1 hour
+# Positive options result cached longer; negative/uncertain results expire fast
+OPTIONS_CACHE_TTL_POSITIVE = 6 * 3600   # 6 hours
+OPTIONS_CACHE_TTL_NEGATIVE = 120        # 2 minutes (rate-limit recovery)
+OPTIONS_CACHE_TTL_UNKNOWN = 300         # 5 minutes
 
 YF_SESSION = requests.Session()
 YF_SESSION.headers.update({
@@ -49,7 +52,7 @@ YF_SESSION.headers.update({
 
 app = FastAPI(title="AI Quant Trading Platform")
 
-# OPTIONS_CACHE: symbol -> {"has_options": bool, "ts": float}
+# OPTIONS_CACHE: symbol -> {"has_options": bool, "ts": float, "ttl": int, "source": str}
 OPTIONS_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # ----------------------------------------------------------------------
@@ -260,22 +263,93 @@ def bs_greeks_and_price(S: float, K: float, T: float, r: float, sigma: float, op
     }
 
 
+def _is_likely_us_optionable(symbol: str) -> bool:
+    """
+    Heuristic: most liquid US equities/ETFs have listed options on Yahoo.
+    HK / CN / other suffixes often do not (or chains are sparse / blocked).
+    Used only as optimistic fallback when Yahoo rate-limits the options endpoint.
+    """
+    s = symbol.strip().upper()
+    if not s:
+        return False
+    # Explicit non-US suffixes that rarely have Yahoo option chains
+    non_us_suffixes = (
+        ".HK", ".SS", ".SZ", ".TW", ".T", ".KS", ".KQ", ".AX", ".L", ".TO",
+        ".V", ".SA", ".MX", ".NS", ".BO", ".SI", ".JK", ".KL", ".BK"
+    )
+    if any(s.endswith(suf) for suf in non_us_suffixes):
+        return False
+    # Pure ticker like NVDA / VOO / RKLB / AAPL → treat as US-optionable fallback
+    return True
+
+
 def _check_has_options(symbol: str) -> bool:
-    """Cached options availability with TTL to avoid rate-limit flicker."""
+    """
+    Robust options availability check.
+
+    Problems this solves:
+    - Yahoo frequently rate-limits `Ticker.options` → empty / exception.
+    - Caching a False result for 1 hour made all US stocks show「不能購買」.
+    - Custom requests.Session sometimes interferes with options endpoint.
+
+    Strategy:
+    1. Honour cache if still within its own TTL.
+    2. Try yfinance WITHOUT custom session (more reliable for options).
+    3. On hard empty chain → cache False (short TTL for non-US, longer if confirmed).
+    4. On rate-limit / any exception:
+       - US-like symbols → optimistic True (short TTL so we re-check soon)
+       - Non-US → False (short TTL)
+    """
+    symbol = symbol.strip().upper()
     now_ts = datetime.now().timestamp()
     cached = OPTIONS_CACHE.get(symbol)
-    if cached and (now_ts - cached.get("ts", 0)) < OPTIONS_CACHE_TTL_SEC:
-        return bool(cached.get("has_options", False))
+    if cached:
+        ttl = cached.get("ttl", OPTIONS_CACHE_TTL_NEGATIVE)
+        if (now_ts - cached.get("ts", 0)) < ttl:
+            return bool(cached.get("has_options", False))
 
     has = False
-    try:
-        stock = yf.Ticker(symbol, session=YF_SESSION)
-        opts = getattr(stock, "options", None)
-        has = bool(opts and len(opts) > 0)
-    except Exception:
-        has = False
+    source = "unknown"
+    ttl = OPTIONS_CACHE_TTL_UNKNOWN
 
-    OPTIONS_CACHE[symbol] = {"has_options": has, "ts": now_ts}
+    try:
+        # Prefer default yfinance session for options — custom Session is a common
+        # cause of empty chains / rate-limit amplification.
+        stock = yf.Ticker(symbol)
+        opts = getattr(stock, "options", None)
+        if opts is not None and len(opts) > 0:
+            has = True
+            source = "yahoo_chain"
+            ttl = OPTIONS_CACHE_TTL_POSITIVE
+        else:
+            # Explicitly empty chain (not an exception)
+            has = False
+            source = "yahoo_empty"
+            # For US names still allow optimistic override if we never saw a chain
+            if _is_likely_us_optionable(symbol):
+                has = True
+                source = "us_optimistic_empty"
+                ttl = OPTIONS_CACHE_TTL_UNKNOWN
+            else:
+                ttl = OPTIONS_CACHE_TTL_NEGATIVE
+    except Exception as e:
+        err_name = type(e).__name__
+        # Rate limit / network / parse errors → do not permanently blacklist
+        if _is_likely_us_optionable(symbol):
+            has = True
+            source = f"us_optimistic_on_error:{err_name}"
+            ttl = OPTIONS_CACHE_TTL_UNKNOWN
+        else:
+            has = False
+            source = f"error:{err_name}"
+            ttl = OPTIONS_CACHE_TTL_NEGATIVE
+
+    OPTIONS_CACHE[symbol] = {
+        "has_options": has,
+        "ts": now_ts,
+        "ttl": ttl,
+        "source": source,
+    }
     return has
 
 
@@ -302,6 +376,7 @@ def calculate_options_recommendation(
         "shock_72h_pct": shock_data.get("shock_72h_pct"),
         "roc_72h_pct": shock_data.get("roc_72h_pct"),
         "has_options": False,
+        "options_source": None,
         "df_len": len(df),
         "gate": None,
         "reason_detail": ""
@@ -310,13 +385,21 @@ def calculate_options_recommendation(
     # Gate 1: options market existence
     has_opts = _check_has_options(symbol)
     debug["has_options"] = has_opts
+    cache_meta = OPTIONS_CACHE.get(symbol, {})
+    debug["options_source"] = cache_meta.get("source")
     if not has_opts:
         debug["gate"] = "NO_OPTIONS_MARKET"
-        debug["reason_detail"] = f"{symbol} 目前無可用期權鏈 (Yahoo options empty or rate-limited)"
+        debug["reason_detail"] = (
+            f"{symbol} 無可用期權鏈 "
+            f"(source={cache_meta.get('source', 'n/a')})"
+        )
         return {
             "strategy": "🚫 不能購買 (無期權市場)",
             "action": "NONE",
-            "reason": f"系統檢測到 {symbol} 目前不支援期權交易或無可用的期權合約。",
+            "reason": (
+                f"系統檢測到 {symbol} 目前不支援期權交易或無可用的期權合約。"
+                f" (偵測來源: {cache_meta.get('source', 'n/a')})"
+            ),
             "strike_price": "N/A",
             "exp_date": "N/A",
             "take_profit_target": "N/A",
@@ -1582,7 +1665,7 @@ def index():
                                 <div>• score = ${d.score} (bull≥${d.score_strong_bull}, floor≥${d.score_neutral_floor})</div>
                                 <div>• has_near_earnings = ${d.has_near_earnings} ${d.earnings_days_left != null ? '(剩餘 ' + d.earnings_days_left + ' 天)' : ''}</div>
                                 <div>• is_high_volatile = ${d.is_high_volatile} (振幅 ${d.shock_72h_pct}% / 漲跌 ${d.roc_72h_pct}%)</div>
-                                <div>• has_options = ${d.has_options} | df_len = ${d.df_len}</div>
+                                <div>• has_options = ${d.has_options} (source: ${d.options_source || 'n/a'}) | df_len = ${d.df_len}</div>
                                 <div>• detail: ${d.reason_detail || '-'}</div>
                             </div>
                         `;
