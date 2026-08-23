@@ -9,14 +9,12 @@
         .chat-scroll::-webkit-scrollbar { width: 6px; }
         .chat-scroll::-webkit-scrollbar-track { background: #0f172a; }
         .chat-scroll::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
-        /* 隱藏 details 預設的原生三角形 */
         details > summary { list-style: none; }
         details > summary::-webkit-details-marker { display: none; }
     </style>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen font-sans">
 
-    <!-- 頂部導覽列 -->
     <header class="bg-slate-900/90 border-b border-slate-800 p-4 sticky top-0 z-50 backdrop-blur flex justify-between items-center">
         <div class="flex items-center space-x-3">
             <span class="text-2xl">📡</span>
@@ -37,39 +35,33 @@
     </header>
 
     <main class="p-4 max-w-[1400px] mx-auto space-y-4">
-        
-        <!-- 股票管理與追蹤列 -->
+
         <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-wrap items-center justify-between gap-4 shadow-lg">
             <div class="flex items-center gap-2">
                 <span class="text-lg">🎯</span>
                 <h2 class="font-bold text-slate-200">追蹤股票清單</h2>
             </div>
-            
+
             <div class="flex items-center gap-2 w-full sm:w-auto">
-                <input type="text" id="stock-input" placeholder="輸入代碼 (例: AAPL, 2330.TW)" 
+                <input type="text" id="stock-input" placeholder="輸入代碼 (例: AAPL, 2330.TW)"
                        onkeypress="if(event.key === 'Enter') addStock()"
                        class="bg-slate-950 border border-slate-700 text-slate-100 text-sm rounded-lg px-3 py-2 focus:outline-none focus:border-cyan-500 uppercase flex-1 sm:w-60">
-                <button onclick="addStock()" 
+                <button onclick="addStock()"
                         class="bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-600 hover:to-blue-700 text-white font-bold text-sm px-4 py-2 rounded-lg transition shadow">
                     + 追蹤
                 </button>
             </div>
         </div>
 
-        <!-- 追蹤標的即時價格與期權建議卡片 -->
-        <div id="ticker-bar" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
-            <!-- JavaScript 動態填入 -->
+        <div id="ticker-bar" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
         </div>
 
-        <!-- 主頻道區域 (Telegram 訊息串視窗) -->
         <section class="bg-slate-900 border border-slate-800 rounded-xl flex flex-col h-[700px] shadow-2xl">
-            <!-- 頻道頂部工具欄 -->
             <div class="p-3 border-b border-slate-800 flex justify-between items-center bg-slate-900/90 rounded-t-xl">
                 <div class="flex items-center gap-2">
                     <span class="text-xl">📢</span>
                     <span class="font-bold text-slate-200"> Telegram 訊息推播頻道</span>
                 </div>
-                <!-- 篩選按鈕區 -->
                 <div class="flex items-center gap-1.5 text-xs">
                     <button onclick="filterFeed('ALL')" id="filter-ALL" class="px-2.5 py-1 rounded bg-cyan-600 text-white font-bold">全部</button>
                     <button onclick="filterFeed('ALERT')" id="filter-ALERT" class="px-2.5 py-1 rounded bg-slate-800 text-slate-400 hover:bg-slate-700">🚨 警訊</button>
@@ -78,9 +70,7 @@
                 </div>
             </div>
 
-            <!-- Telegram 風格對話框滾動區 -->
             <div id="chat-feed" class="flex-1 p-4 overflow-y-auto space-y-3 chat-scroll bg-slate-950/70">
-                <!-- Telegram 訊息卡片 -->
             </div>
         </section>
 
@@ -91,11 +81,21 @@
         let rawFeedData = [];
         let latestStates = {};
 
-        // 使用 Set 穩固記憶使用者手動展開的項目
-        const expandedTickerOptions = new Set();
+        // 展開狀態（輪詢重繪後仍保留）
+        const expandedSections = new Set(JSON.parse(localStorage.getItem('expandedSections') || '[]'));
         const expandedFeedMessages = new Set();
 
-        // 產生絕對穩定 ID 的雜湊函數 (不受陣列變動影響)
+        function persistExpanded() {
+            localStorage.setItem('expandedSections', JSON.stringify(Array.from(expandedSections).slice(-100)));
+        }
+
+        function toggleSection(key) {
+            if (expandedSections.has(key)) expandedSections.delete(key);
+            else expandedSections.add(key);
+            persistExpanded();
+            renderTickerBar();
+        }
+
         function generateHash(str) {
             let hash = 0;
             if (str.length === 0) return hash;
@@ -107,75 +107,179 @@
             return Math.abs(hash).toString(36);
         }
 
-        // 攔截並控制所有展開/折疊行為
-        function handleToggle(e, id, type) {
-            e.preventDefault(); // 阻止原生 details 行為，交由 React-like 的方式統一控制狀態
-            if (type === 'ticker') {
-                if (expandedTickerOptions.has(id)) expandedTickerOptions.delete(id);
-                else expandedTickerOptions.add(id);
-                renderTickerBar();
-            } else if (type === 'feed') {
-                if (expandedFeedMessages.has(id)) expandedFeedMessages.delete(id);
-                else expandedFeedMessages.add(id);
-                renderFeed();
-            }
+        function handleFeedToggle(e, id) {
+            e.preventDefault();
+            if (expandedFeedMessages.has(id)) expandedFeedMessages.delete(id);
+            else expandedFeedMessages.add(id);
+            renderFeed();
         }
 
-        // 渲染頂部股票卡片區塊
         function renderTickerBar() {
             const tickerBar = document.getElementById('ticker-bar');
-            if (!latestStates || Object.keys(latestStates).length === 0) return;
+            if (!latestStates || Object.keys(latestStates).length === 0) {
+                tickerBar.innerHTML = `<div class="col-span-full text-center text-slate-500 text-sm py-6">尚無追蹤標的</div>`;
+                return;
+            }
 
             tickerBar.innerHTML = Object.entries(latestStates).map(([symbol, stockState]) => {
                 const price = stockState.current_price;
-                const opt = stockState.options_rec;
-                const isExpanded = expandedTickerOptions.has(symbol);
-                
+                const opt = stockState.options_rec || {};
+                const pred = stockState.pred || null;
+                const risk = stockState.risk || {};
+                const tech = stockState.tech || {};
+                const shock = stockState.shock_data || {};
+                const score = stockState.score;
+                const advice = stockState.advice || '';
+
+                const optKey = symbol + '__opt';
+                const mlKey = symbol + '__ml';
+                const modelsKey = symbol + '__models';
+                const riskKey = symbol + '__risk';
+                const techKey = symbol + '__tech';
+
                 let optBadge = '<span class="text-slate-500">無期權建議</span>';
-                let hasDetails = false;
-
-                if (opt) {
-                    if (opt.action === 'BUY_CALL') optBadge = `<span class="text-emerald-400 font-bold">${opt.strategy || 'BUY CALL'}</span>`;
-                    else if (opt.action === 'SELL_PUT') optBadge = `<span class="text-purple-400 font-bold">${opt.strategy || 'SELL PUT'}</span>`;
-                    else optBadge = `<span class="text-slate-300 font-bold">${opt.strategy || opt.action || '期權建議'}</span>`;
-
-                    if (opt.strike_price || opt.take_profit_target || opt.stop_loss) {
-                        hasDetails = true;
-                    }
+                let hasOptDetails = false;
+                if (opt && opt.strategy) {
+                    if (opt.action === 'BUY_CALL') optBadge = `<span class="text-emerald-400 font-bold">${opt.strategy}</span>`;
+                    else if (opt.action === 'SELL_PUT') optBadge = `<span class="text-purple-400 font-bold">${opt.strategy}</span>`;
+                    else optBadge = `<span class="text-slate-300 font-bold">${opt.strategy}</span>`;
+                    if (opt.strike_price || opt.exp_date || opt.take_profit_target || opt.reason) hasOptDetails = true;
                 }
 
+                // 模型明細 HTML
+                let modelsHtml = '<div class="text-slate-500">尚無模型明細</div>';
+                if (pred && pred.model_list && pred.model_list.length) {
+                    modelsHtml = pred.model_list.map(m => {
+                        const w = (m.weight != null) ? ` <span class="text-cyan-400">[${m.weight}%]</span>` : '';
+                        return `<div>• <b>${m.name}</b>${w}: $${Number(m.open).toFixed(2)} / $${Number(m.high).toFixed(2)} / $${Number(m.low).toFixed(2)}</div>`;
+                    }).join('');
+                }
+
+                const predSummary = pred ? `
+                    <div class="text-[10px] text-cyan-200/90 space-y-0.5 font-mono">
+                        <div>開 <b>$${Number(pred.pred_open).toFixed(2)}</b> (${pred.open_pct || ''})</div>
+                        <div>高 <b>$${Number(pred.pred_high).toFixed(2)}</b>　低 <b>$${Number(pred.pred_low).toFixed(2)}</b></div>
+                        <div class="text-slate-400">信心度：${pred.confidence || '—'}</div>
+                    </div>
+                ` : `<div class="text-[10px] text-slate-500">預測計算中…</div>`;
+
+                const riskPos = risk.position != null ? risk.position : '—';
+                const riskSL = risk.stop_loss != null ? Number(risk.stop_loss).toFixed(2) : '—';
+                const riskTP = risk.take_profit != null ? Number(risk.take_profit).toFixed(2) : '—';
+                const riskTS = risk.trailing_stop != null ? Number(risk.trailing_stop).toFixed(2) : '—';
+
                 return `
-                    <div class="relative p-3 rounded-xl border bg-slate-900 border-slate-800 text-left group hover:border-slate-700 transition space-y-2">
-                        <button onclick="removeStock('${symbol}')" 
-                                class="absolute top-1 right-2 text-slate-500 hover:text-red-400 font-bold text-xs p-1 z-10" 
+                    <div class="relative p-3 rounded-xl border bg-slate-900 border-slate-800 text-left hover:border-slate-700 transition space-y-2">
+                        <button onclick="removeStock('${symbol}')"
+                                class="absolute top-1 right-2 text-slate-500 hover:text-red-400 font-bold text-xs p-1 z-10"
                                 title="移除追蹤">✕</button>
-                        
+
                         <div class="flex justify-between items-center pr-4">
-                            <span class="text-xs text-slate-400 font-bold">${symbol}</span>
-                            <span class="text-sm font-bold text-emerald-400 font-mono">$${price ? price.toFixed(2) : '---'}</span>
+                            <div>
+                                <span class="text-xs text-slate-400 font-bold">${symbol}</span>
+                                ${score != null ? `<span class="ml-1 text-[10px] text-slate-500">${score}分 · ${advice}</span>` : ''}
+                            </div>
+                            <span class="text-sm font-bold text-emerald-400 font-mono">$${price != null ? Number(price).toFixed(2) : '---'}</span>
                         </div>
 
-                        <!-- 期權折疊選單區塊 -->
-                        <details ${isExpanded ? 'open' : ''} class="text-[11px] border-t border-slate-800/80 pt-1 transition-all">
-                            <summary onclick="handleToggle(event, '${symbol}', 'ticker')" 
-                                     class="${hasDetails ? 'cursor-pointer hover:bg-slate-800/50 rounded' : 'cursor-default pointer-events-none'} flex justify-between items-center py-1 px-1 select-none">
-                                <div class="flex items-center gap-1">
+                        <!-- 期權（摺疊） -->
+                        <div class="text-[11px] border-t border-slate-800/80 pt-1">
+                            <button type="button" onclick="toggleSection('${optKey}')"
+                                    class="w-full flex justify-between items-center py-1 px-1 rounded hover:bg-slate-800/50 select-none ${hasOptDetails ? '' : 'opacity-80'}">
+                                <div class="flex items-center gap-1 text-left">
                                     <span class="text-[10px] text-slate-400">🎯 期權:</span>
                                     ${optBadge}
                                 </div>
-                                ${hasDetails ? `<span class="text-[10px] text-cyan-400 font-mono flex items-center gap-0.5">${isExpanded ? '收起 ▲' : '詳情 ▼'}</span>` : ''}
-                            </summary>
-                            ${hasDetails ? `
-                                <div class="mt-1 pl-2.5 border-l-2 border-cyan-500/50 space-y-1 py-1.5 bg-slate-950/50 rounded-r">
-                                    ${opt.strike_price ? `<div class="text-[10px] text-slate-300">行使價: <span class="text-cyan-300 font-mono font-bold">${opt.strike_price}</span></div>` : ''}
-                                    ${opt.take_profit_target ? `<div class="text-[10px] text-emerald-400">平倉目標: <span class="font-mono">${opt.take_profit_target}</span></div>` : ''}
-                                    ${opt.stop_loss ? `<div class="text-[10px] text-rose-400">停損目標: <span class="font-mono">${opt.stop_loss}</span></div>` : ''}
+                                ${hasOptDetails ? `<span class="text-[10px] text-cyan-400 font-mono shrink-0">${expandedSections.has(optKey) ? '收起 ▲' : '詳情 ▼'}</span>` : ''}
+                            </button>
+                            ${hasOptDetails && expandedSections.has(optKey) ? `
+                                <div class="mt-1 pl-2.5 border-l-2 border-cyan-500/50 space-y-1 py-1.5 bg-slate-950/50 rounded-r text-[10px]">
+                                    ${opt.strike_price ? `<div class="text-slate-300">行使價: <span class="text-cyan-300 font-mono font-bold">${opt.strike_price}</span></div>` : ''}
+                                    ${opt.exp_date ? `<div class="text-slate-300">到期: <span class="font-mono">${opt.exp_date}</span></div>` : ''}
+                                    ${opt.take_profit_target ? `<div class="text-emerald-400">平倉目標: <span class="font-mono">${opt.take_profit_target}</span></div>` : ''}
+                                    ${opt.reason ? `<div class="text-slate-500 leading-snug">${opt.reason}</div>` : ''}
                                 </div>
                             ` : ''}
-                        </details>
+                        </div>
+
+                        <!-- 13-ML 預估摘要（摺疊，標題列顯示開盤預估） -->
+                        <div class="text-[11px] border-t border-slate-800/80 pt-1">
+                            <button type="button" onclick="toggleSection('${mlKey}')"
+                                    class="w-full flex justify-between items-center py-1 px-1 rounded hover:bg-slate-800/50 select-none">
+                                <span class="text-[10px] text-cyan-400 font-bold text-left">
+                                    🔮 13-ML 預估
+                                    ${pred ? `<span class="text-cyan-200/80 font-mono font-normal">開 $${Number(pred.pred_open).toFixed(2)}</span>` : ''}
+                                </span>
+                                <span class="text-[10px] text-cyan-400 font-mono shrink-0">${expandedSections.has(mlKey) ? '收起 ▲' : '展開 ▼'}</span>
+                            </button>
+                            ${expandedSections.has(mlKey) ? `
+                                <div class="mt-1 p-2 bg-slate-950/60 rounded border border-slate-800/80">
+                                    ${predSummary}
+                                </div>
+                            ` : ''}
+                        </div>
+
+                        <!-- 13 模型明細（摺疊） -->
+                        <div class="text-[11px] border-t border-slate-800/80 pt-1">
+                            <button type="button" onclick="toggleSection('${modelsKey}')"
+                                    class="w-full flex justify-between items-center py-1 px-1 rounded hover:bg-slate-800/50 select-none">
+                                <span class="text-[10px] text-slate-400 font-bold text-left">
+                                    🤖 模型明細（依權重${pred && pred.model_list ? '，' + pred.model_list.length + ' 個' : ''}）
+                                </span>
+                                <span class="text-[10px] text-cyan-400 font-mono shrink-0">${expandedSections.has(modelsKey) ? '收起 ▲' : '展開 ▼'}</span>
+                            </button>
+                            ${expandedSections.has(modelsKey) ? `
+                                <div class="mt-1 p-2 bg-slate-950/60 rounded border border-slate-800/80 text-[10px] text-slate-300 font-mono space-y-0.5 max-h-32 overflow-y-auto">
+                                    ${modelsHtml}
+                                </div>
+                            ` : ''}
+                        </div>
+
+                        <!-- 技術細節（摺疊） -->
+                        <div class="text-[11px] border-t border-slate-800/80 pt-1">
+                            <button type="button" onclick="toggleSection('${techKey}')"
+                                    class="w-full flex justify-between items-center py-1 px-1 rounded hover:bg-slate-800/50 select-none">
+                                <span class="text-[10px] text-slate-400 font-bold text-left">
+                                    📊 技術細節
+                                    <span class="text-slate-500 font-normal">RSI ${tech.rsi != null ? tech.rsi : '—'}｜KDJ ${tech.k != null ? tech.k : '—'}/${tech.d != null ? tech.d : '—'}</span>
+                                </span>
+                                <span class="text-[10px] text-cyan-400 font-mono shrink-0">${expandedSections.has(techKey) ? '收起 ▲' : '展開 ▼'}</span>
+                            </button>
+                            ${expandedSections.has(techKey) ? `
+                                <div class="mt-1 p-2 bg-slate-950/60 rounded border border-slate-800/80 text-[10px] text-slate-300 font-mono space-y-0.5">
+                                    <div>• RSI (14): ${tech.rsi != null ? tech.rsi : '—'}</div>
+                                    <div>• KDJ: K:${tech.k != null ? tech.k : '—'} / D:${tech.d != null ? tech.d : '—'}</div>
+                                    <div>• MACD 柱狀體: ${tech.macd_hist != null ? ((tech.macd_hist >= 0 ? '+' : '') + tech.macd_hist) : '—'}</div>
+                                    <div>• 均線: MA5($${tech.ma5 != null ? Number(tech.ma5).toFixed(2) : '—'}) | MA10($${tech.ma10 != null ? Number(tech.ma10).toFixed(2) : '—'}) | MA20($${tech.ma20 != null ? Number(tech.ma20).toFixed(2) : '—'})</div>
+                                    <div>• 量價結構 (成交量倍數): ${tech.vol_ratio != null ? tech.vol_ratio : '—'}x</div>
+                                    <div class="${shock.is_high_volatile ? 'text-amber-400 font-bold' : ''}">• ⚡ 近 72h 振幅: ${shock.shock_72h_pct != null ? shock.shock_72h_pct : 0}% | 近 72h 淨漲跌: ${shock.roc_72h_pct != null ? shock.roc_72h_pct : 0}%</div>
+                                    <div>• ATR 波動: $${tech.atr != null ? Number(tech.atr).toFixed(2) : '—'} | 布林帶寬: ${tech.bb_width != null ? tech.bb_width : '—'}%</div>
+                                </div>
+                            ` : ''}
+                        </div>
+
+                        <!-- 動態風控（摺疊，標題列顯示倉位與停損） -->
+                        <div class="text-[11px] border-t border-slate-800/80 pt-1">
+                            <button type="button" onclick="toggleSection('${riskKey}')"
+                                    class="w-full flex justify-between items-center py-1 px-1 rounded hover:bg-indigo-950/40 select-none">
+                                <span class="text-[10px] text-indigo-400 font-bold text-left">
+                                    🛡️ 風控
+                                    <span class="text-indigo-300/80 font-normal">倉位 ${riskPos}｜停損 $${riskSL}</span>
+                                </span>
+                                <span class="text-[10px] text-indigo-300 font-mono shrink-0">${expandedSections.has(riskKey) ? '收起 ▲' : '展開 ▼'}</span>
+                            </button>
+                            ${expandedSections.has(riskKey) ? `
+                                <div class="mt-1 p-2 bg-indigo-950/30 rounded border border-indigo-900/50 text-[10px] text-indigo-200 font-mono space-y-0.5">
+                                    <div>• 建議倉位: ${riskPos}</div>
+                                    <div>• 建議停損: $${riskSL}</div>
+                                    <div>• 建議停利: $${riskTP}</div>
+                                    <div>• 移動停損: $${riskTS}</div>
+                                </div>
+                            ` : ''}
+                        </div>
 
                         <div class="pt-0.5 flex justify-end">
-                            <button onclick="triggerML('${symbol}')" 
+                            <button onclick="triggerML('${symbol}')"
                                     class="text-[10px] bg-slate-800 hover:bg-cyan-950 text-cyan-400 hover:text-cyan-300 border border-slate-700 px-2 py-0.5 rounded transition">
                                 🤖 ML 預測
                             </button>
@@ -185,10 +289,9 @@
             }).join('');
         }
 
-        // 渲染 Telegram 訊息卡片
         function renderFeed() {
             const chatBox = document.getElementById('chat-feed');
-            
+
             const filteredFeed = rawFeedData.filter(msg => {
                 if (currentFilter === 'ALL') return true;
                 return msg.type === currentFilter;
@@ -202,7 +305,7 @@
             chatBox.innerHTML = filteredFeed.map((msg) => {
                 let badgeStyle = "bg-slate-800 text-slate-300 border-slate-700";
                 let borderStyle = "border-slate-800 bg-slate-900/80";
-                
+
                 if (msg.level === "danger") {
                     badgeStyle = "bg-red-950 text-red-400 border-red-800 animate-pulse";
                     borderStyle = "border-red-900/50 bg-red-950/20";
@@ -220,18 +323,16 @@
                     borderStyle = "border-cyan-900/50 bg-cyan-950/20";
                 }
 
-                // 產生穩定 ID (完全脫離原本的 index 綁定)
                 const rawString = `${msg.timestamp}_${msg.symbol}_${msg.title}`;
                 const msgId = msg.id || 'uid_' + generateHash(rawString);
-                
                 const isExpanded = expandedFeedMessages.has(msgId);
-                const formattedContent = msg.content.replace(/\n/g, '<br>');
+                const formattedContent = (msg.content || '').replace(/\n/g, '<br>');
 
                 let contentArea = '';
                 if (msg.type === 'OPTIONS') {
                     contentArea = `
                         <details ${isExpanded ? 'open' : ''} class="mt-2 border-t border-slate-800/80 pt-1.5 transition-all">
-                            <summary onclick="handleToggle(event, '${msgId}', 'feed')" 
+                            <summary onclick="handleFeedToggle(event, '${msgId}')"
                                      class="text-xs font-semibold text-cyan-400 hover:text-cyan-300 flex items-center justify-between w-full py-1.5 px-2.5 rounded bg-slate-800/40 hover:bg-slate-800/80 transition select-none cursor-pointer">
                                 <span>🎯 查看期權建議細節</span>
                                 <span class="text-[10px] font-mono">${isExpanded ? '點擊折疊 ▲' : '點擊展開 ▼'}</span>
@@ -324,6 +425,20 @@
 
                 if (data.feed) {
                     rawFeedData = data.feed;
+                    renderFeed();
+                } else if (data.alert_history) {
+                    // 相容 main.py：把 alert_history 轉成 feed 格式
+                    rawFeedData = (data.alert_history || []).map(a => ({
+                        id: a.id,
+                        type: 'ALERT',
+                        level: (a.signal || '').includes('暴跌') ? 'danger'
+                             : (a.signal || '').includes('暴升') ? 'success'
+                             : (a.signal || '').includes('抄底') ? 'cyan' : 'warning',
+                        symbol: a.symbol,
+                        title: a.signal || '市場警訊',
+                        content: `價格 $${a.price}｜${a.session || ''}｜${a.time || ''}`,
+                        timestamp: a.time || ''
+                    }));
                     renderFeed();
                 }
 

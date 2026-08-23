@@ -1757,6 +1757,10 @@ def index():
             50% { border-color: rgba(239, 68, 68, 0.9); box-shadow: 0 0 25px rgba(239, 68, 68, 0.6); }
         }
         .alert-modal-glow { animation: pulse-border 2s infinite; }
+        details > summary { list-style: none; cursor: pointer; }
+        details > summary::-webkit-details-marker { display: none; }
+        details summary .chevron::after { content: " ▼"; font-size: 10px; opacity: 0.7; }
+        details[open] summary .chevron::after { content: " ▲"; }
     </style>
 </head>
 <body class="p-4 md:p-6 relative">
@@ -1826,6 +1830,15 @@ def index():
 
     <script>
         let dismissedAlertIds = new Set(JSON.parse(localStorage.getItem('dismissedAlertIds') || '[]'));
+        // 記住卡片內摺疊區塊的展開狀態（避免 3 秒輪詢重繪後被收合）
+        const expandedCardSections = new Set(JSON.parse(localStorage.getItem('expandedCardSections') || '[]'));
+
+        function toggleCardSection(key) {
+            if (expandedCardSections.has(key)) expandedCardSections.delete(key);
+            else expandedCardSections.add(key);
+            localStorage.setItem('expandedCardSections', JSON.stringify(Array.from(expandedCardSections).slice(-80)));
+            fetchState();
+        }
 
         async function fetchState() {
             try {
@@ -2164,7 +2177,12 @@ def index():
                         ${optionsHtml}
 
                         <div class="space-y-1">
-                            <div class="text-xs font-bold text-gray-400">📊 技術細節：</div>
+                            <button type="button" onclick="toggleCardSection('${symbol}__tech')"
+                                    class="w-full text-left text-xs font-bold text-gray-400 flex items-center justify-between py-1.5 px-1 rounded hover:bg-gray-800/50 select-none">
+                                <span>📊 技術細節 <span class="text-gray-500 font-normal">（RSI ${t.rsi}｜KDJ ${t.k}/${t.d}）</span></span>
+                                <span class="text-cyan-400 text-[10px] font-mono">${expandedCardSections.has(symbol + '__tech') ? '收起 ▲' : '展開 ▼'}</span>
+                            </button>
+                            ${expandedCardSections.has(symbol + '__tech') ? `
                             <div class="block-bg rounded-lg p-3 text-xs text-gray-300 space-y-1 font-mono leading-relaxed">
                                 <div>• RSI (14): ${t.rsi}</div>
                                 <div>• KDJ: K:${t.k} / D:${t.d}</div>
@@ -2173,7 +2191,7 @@ def index():
                                 <div>• 量價結構 (成交量倍數): ${t.vol_ratio}x</div>
                                 <div class="${s && s.is_high_volatile ? 'text-amber-400 font-bold' : ''}">• ⚡ 近 72h 振幅: ${s ? s.shock_72h_pct : 0}% | 近 72h 淨漲跌: ${s ? s.roc_72h_pct : 0}%</div>
                                 <div>• ATR 波動: $${t.atr.toFixed(2)} | 布林帶寬: ${t.bb_width}%</div>
-                            </div>
+                            </div>` : ''}
                         </div>
 
                         ${p ? `
@@ -2189,21 +2207,31 @@ def index():
                         </div>
 
                         <div class="space-y-1">
-                            <div class="text-xs font-bold text-gray-400">🤖 13 大 AI 模型預測明細（依權重排序，共 ${p.model_list ? p.model_list.length : 13} 個）：</div>
+                            <button type="button" onclick="toggleCardSection('${symbol}__models')"
+                                    class="w-full text-left text-xs font-bold text-gray-400 flex items-center justify-between py-1.5 px-1 rounded hover:bg-gray-800/50 select-none">
+                                <span>🤖 13 大 AI 模型預測明細（依權重排序，共 ${p.model_list ? p.model_list.length : 13} 個）</span>
+                                <span class="text-cyan-400 text-[10px] font-mono">${expandedCardSections.has(symbol + '__models') ? '收起 ▲' : '展開 ▼'}</span>
+                            </button>
+                            ${expandedCardSections.has(symbol + '__models') ? `
                             <div class="block-bg rounded-lg p-3 text-[11px] text-gray-300 grid grid-cols-1 gap-1 max-h-36 overflow-y-auto font-mono">
                                 ${modelsHtml}
-                            </div>
+                            </div>` : ''}
                         </div>
                         ` : ''}
 
                         <div class="space-y-1">
-                            <div class="text-xs font-bold text-indigo-400">🛡️ 動態風控建議：</div>
+                            <button type="button" onclick="toggleCardSection('${symbol}__risk')"
+                                    class="w-full text-left text-xs font-bold text-indigo-400 flex items-center justify-between py-1.5 px-1 rounded hover:bg-indigo-950/40 select-none">
+                                <span>🛡️ 動態風控建議 <span class="text-indigo-300/80 font-normal">（倉位 ${r.position}｜停損 $${r.stop_loss.toFixed(2)}）</span></span>
+                                <span class="text-indigo-300 text-[10px] font-mono">${expandedCardSections.has(symbol + '__risk') ? '收起 ▲' : '展開 ▼'}</span>
+                            </button>
+                            ${expandedCardSections.has(symbol + '__risk') ? `
                             <div class="bg-indigo-950/40 border border-indigo-900/60 rounded-lg p-3 text-xs text-indigo-200 space-y-1 font-mono">
                                 <div>• 建議倉位: ${r.position}</div>
                                 <div>• 建議停損: $${r.stop_loss.toFixed(2)}</div>
                                 <div>• 建議停利: $${r.take_profit.toFixed(2)}</div>
                                 <div>• 移動停損: $${r.trailing_stop.toFixed(2)}</div>
-                            </div>
+                            </div>` : ''}
                         </div>
 
                         <div class="space-y-1">
