@@ -64,7 +64,8 @@ def load_state() -> Dict[str, Any]:
         "stock_states": {},
         "pred_audit": {},
         "model_maes": {},
-        "alert_history": []
+        "alert_history": [],
+        "earnings_cache": {},  # symbol -> {date, ts, source} — sync Mac/Render under rate-limit
     }
     if os.path.exists(STATE_FILE):
         try:
@@ -163,18 +164,145 @@ def get_macro_events(start_date: datetime.date, end_date: datetime.date) -> List
 
 
 def _parse_earnings_date(raw) -> Optional[datetime.date]:
-    """Robustly turn Yahoo calendar earnings value into a date."""
+    """Robustly turn Yahoo calendar / earnings_dates value into a date."""
     if raw is None:
         return None
     try:
-        if hasattr(raw, "date") and callable(raw.date):
-            return raw.date()
         if isinstance(raw, datetime):
+            return raw.date()
+        # Already a date
+        if type(raw).__name__ == "date" and hasattr(raw, "year"):
+            return raw  # type: ignore
+        # pandas Timestamp / datetime-like
+        if hasattr(raw, "to_pydatetime"):
+            return raw.to_pydatetime().date()
+        if hasattr(raw, "date") and callable(raw.date):
             return raw.date()
         s = str(raw)[:10]
         return datetime.strptime(s, "%Y-%m-%d").date()
     except Exception:
         return None
+
+
+# Persist last-known upcoming earnings so rate-limited hosts (e.g. Render)
+# stay consistent with environments that successfully fetched the date.
+# symbol -> {"date": "YYYY-MM-DD", "ts": float, "source": str}
+EARNINGS_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _load_persisted_earnings(symbol: str) -> Optional[datetime.date]:
+    try:
+        store = GLOBAL_STATE.setdefault("earnings_cache", {})
+        item = store.get(symbol) or EARNINGS_CACHE.get(symbol)
+        if not item:
+            return None
+        return _parse_earnings_date(item.get("date"))
+    except Exception:
+        return None
+
+
+def _save_persisted_earnings(symbol: str, ed: datetime.date, source: str):
+    payload = {
+        "date": ed.strftime("%Y-%m-%d"),
+        "ts": datetime.now().timestamp(),
+        "source": source,
+    }
+    EARNINGS_CACHE[symbol] = payload
+    try:
+        store = GLOBAL_STATE.setdefault("earnings_cache", {})
+        store[symbol] = payload
+        save_state(GLOBAL_STATE)
+    except Exception:
+        pass
+
+
+def _fetch_next_earnings_date(
+    symbol: str, now_tz: datetime.date, end_date: datetime.date
+) -> Tuple[Optional[datetime.date], str]:
+    """
+    Multi-source earnings lookup.
+
+    Root cause of Mac HARD_BLOCK vs Render SELL_PUT:
+    Yahoo calendar is often rate-limited on cloud (Render) → no Earnings event
+    → has_near_earnings=false → incorrectly allows options.
+
+    Strategy:
+    1. calendar
+    2. get_earnings_dates / earnings_dates
+    3. persisted cache in state_v2.json (survives rate-limit & restarts)
+    """
+    candidates: List[Tuple[datetime.date, str]] = []
+
+    # --- Source A: calendar ---
+    try:
+        stock = yf.Ticker(symbol)  # default session; custom session worsens rate-limit
+        cal = None
+        try:
+            cal = stock.calendar
+        except Exception:
+            cal = None
+        if cal is not None:
+            raw_list: List[Any] = []
+            if isinstance(cal, dict) and "Earnings Date" in cal:
+                v = cal["Earnings Date"]
+                raw_list = list(v) if isinstance(v, (list, tuple)) else [v]
+            elif isinstance(cal, pd.DataFrame):
+                if "Earnings Date" in cal.index:
+                    raw_list = cal.loc["Earnings Date"].dropna().tolist()
+                elif "Earnings Date" in cal.columns:
+                    raw_list = cal["Earnings Date"].dropna().tolist()
+            for raw in raw_list:
+                ed = _parse_earnings_date(raw)
+                if ed is not None:
+                    candidates.append((ed, "calendar"))
+    except Exception:
+        pass
+
+    # --- Source B: get_earnings_dates / earnings_dates ---
+    try:
+        stock = yf.Ticker(symbol)
+        ed_df = None
+        try:
+            if hasattr(stock, "get_earnings_dates"):
+                ed_df = stock.get_earnings_dates(limit=12)
+        except Exception:
+            ed_df = None
+        if ed_df is None:
+            try:
+                ed_df = getattr(stock, "earnings_dates", None)
+            except Exception:
+                ed_df = None
+        if isinstance(ed_df, pd.DataFrame) and not ed_df.empty:
+            for idx in ed_df.index:
+                ed = _parse_earnings_date(idx)
+                if ed is not None:
+                    candidates.append((ed, "earnings_dates"))
+    except Exception:
+        pass
+
+    upcoming = sorted(
+        [(d, src) for d, src in candidates if now_tz <= d <= end_date],
+        key=lambda x: x[0],
+    )
+    if upcoming:
+        best_d, best_src = upcoming[0]
+        _save_persisted_earnings(symbol, best_d, best_src)
+        return best_d, best_src
+
+    # --- Source C: persisted (Mac may have saved it; Render reuses) ---
+    cached = _load_persisted_earnings(symbol)
+    if cached is not None and now_tz <= cached <= end_date:
+        return cached, "persisted_cache"
+
+    # Remember any future date even outside 30d window for later
+    future_any = sorted(
+        [(d, src) for d, src in candidates if d >= now_tz],
+        key=lambda x: x[0],
+    )
+    if future_any:
+        _save_persisted_earnings(symbol, future_any[0][0], future_any[0][1])
+
+    return None, "none"
 
 
 def fetch_stock_events(symbol: str) -> List[Dict[str, Any]]:
@@ -183,39 +311,18 @@ def fetch_stock_events(symbol: str) -> List[Dict[str, Any]]:
     now_tz = datetime.now(ZoneInfo(tz_str)).date()
     end_date = now_tz + timedelta(days=30)
 
-    events = []
-    try:
-        stock = yf.Ticker(symbol, session=YF_SESSION)
-        cal = None
-        try:
-            cal = stock.calendar
-        except Exception:
-            cal = None
-
-        earn_date_found = None
-        if cal is not None:
-            if isinstance(cal, dict) and "Earnings Date" in cal:
-                e_list = cal["Earnings Date"]
-                if e_list and len(e_list) > 0:
-                    earn_date_found = e_list[0]
-            elif isinstance(cal, pd.DataFrame) and "Earnings Date" in cal.index:
-                e_list = cal.loc["Earnings Date"].dropna().tolist()
-                if e_list and len(e_list) > 0:
-                    earn_date_found = e_list[0]
-
-        ed = _parse_earnings_date(earn_date_found)
-        if ed is not None and now_tz <= ed <= end_date:
-            days_left = (ed - now_tz).days
-            events.append({
-                "date": ed.strftime("%Y-%m-%d"),
-                "days_left": days_left,
-                "title": f"📊 {symbol} 季度業績報告發佈 (Earnings)",
-                "tag": "🚨 業績日",
-                "tag_color": "bg-rose-950 text-rose-300 border-rose-800 font-black animate-pulse",
-                "impact": "極高波動風險！股價單日可能有 > ±8% 暴升暴跌"
-            })
-    except Exception:
-        pass
+    events: List[Dict[str, Any]] = []
+    ed, earn_src = _fetch_next_earnings_date(symbol, now_tz, end_date)
+    if ed is not None:
+        days_left = (ed - now_tz).days
+        events.append({
+            "date": ed.strftime("%Y-%m-%d"),
+            "days_left": days_left,
+            "title": f"📊 {symbol} 季度業績報告發佈 (Earnings)",
+            "tag": "🚨 業績日",
+            "tag_color": "bg-rose-950 text-rose-300 border-rose-800 font-black animate-pulse",
+            "impact": f"極高波動風險！股價單日可能有 > ±8% 暴升暴跌 (來源: {earn_src})",
+        })
 
     macro_events = get_macro_events(now_tz, end_date)
     events.extend(macro_events)
