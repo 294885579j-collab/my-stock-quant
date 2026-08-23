@@ -2,10 +2,12 @@ import os
 import json
 import asyncio
 import warnings
+import tempfile
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, Any, List
+from contextlib import asynccontextmanager
 
 import numpy as np
 import pandas as pd
@@ -43,12 +45,10 @@ YF_SESSION.headers.update({
     "Cache-Control": "no-cache"
 })
 
-app = FastAPI(title="AI Quant Trading Platform")
-
-OPTIONS_CACHE = {}
+OPTIONS_CACHE: Dict[str, bool] = {}
 
 # ----------------------------------------------------------------------
-# 狀態載入與儲存
+# 狀態載入與安全儲存（原子化寫入）
 # ----------------------------------------------------------------------
 def load_state() -> Dict[str, Any]:
     default_state = {
@@ -72,8 +72,11 @@ def load_state() -> Dict[str, Any]:
 
 def save_state(state: Dict[str, Any]):
     try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2, ensure_ascii=False)
+        dir_name = os.path.dirname(os.path.abspath(STATE_FILE)) or "."
+        with tempfile.NamedTemporaryFile("w", delete=False, dir=dir_name, encoding="utf-8") as tf:
+            json.dump(state, tf, indent=2, ensure_ascii=False)
+            temp_name = tf.name
+        os.replace(temp_name, STATE_FILE)
     except Exception as e:
         print(f"保存 {STATE_FILE} 失敗: {e}")
 
@@ -212,25 +215,27 @@ def bs_greeks_and_price(S: float, K: float, T: float, r: float, sigma: float, op
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return {"price": 0.0, "delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "rho": 0.0, "pop": 0.0, "d1": 0.0, "d2": 0.0}
     
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
+    sqrt_T = np.sqrt(T)
+    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * sqrt_T)
+    d2 = d1 - sigma * sqrt_T
     pdf_d1 = norm.pdf(d1)
+    exp_rT = np.exp(-r * T)
     
     if option_type == "call":
-        price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+        price = S * norm.cdf(d1) - K * exp_rT * norm.cdf(d2)
         delta = norm.cdf(d1)
         pop = norm.cdf(d2) 
-        theta = (- (S * pdf_d1 * sigma) / (2 * np.sqrt(T)) - r * K * np.exp(-r * T) * norm.cdf(d2)) / 365.0
-        rho = (K * T * np.exp(-r * T) * norm.cdf(d2)) / 100.0
+        theta = (- (S * pdf_d1 * sigma) / (2 * sqrt_T) - r * K * exp_rT * norm.cdf(d2)) / 365.0
+        rho = (K * T * exp_rT * norm.cdf(d2)) / 100.0
     else:
-        price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+        price = K * exp_rT * norm.cdf(-d2) - S * norm.cdf(-d1)
         delta = norm.cdf(d1) - 1.0
         pop = norm.cdf(-d2) 
-        theta = (- (S * pdf_d1 * sigma) / (2 * np.sqrt(T)) + r * K * np.exp(-r * T) * norm.cdf(-d2)) / 365.0
-        rho = (- K * T * np.exp(-r * T) * norm.cdf(-d2)) / 100.0
+        theta = (- (S * pdf_d1 * sigma) / (2 * sqrt_T) + r * K * exp_rT * norm.cdf(-d2)) / 365.0
+        rho = (- K * T * exp_rT * norm.cdf(-d2)) / 100.0
         
-    gamma = pdf_d1 / (S * sigma * np.sqrt(T))
-    vega = (S * pdf_d1 * np.sqrt(T)) / 100.0
+    gamma = pdf_d1 / (S * sigma * sqrt_T)
+    vega = (S * pdf_d1 * sqrt_T) / 100.0
     
     return {
         "price": float(price),
@@ -437,12 +442,10 @@ def get_stock_session(symbol: str) -> str:
         time_num = now_hk.hour * 100 + now_hk.minute
         if 900 <= time_num < 930:
             return "PRE"
-        elif 930 <= time_num < 1200:
+        elif 930 <= time_num < 1200 or 1300 <= time_num < 1610:
             return "REGULAR"
         elif 1200 <= time_num < 1300:
             return "LUNCH_BREAK"
-        elif 1300 <= time_num < 1610:
-            return "REGULAR"
         else:
             return "CLOSED"
     else:
@@ -461,9 +464,8 @@ def get_stock_session(symbol: str) -> str:
 
 def normalize_symbol(symbol: str) -> str:
     symbol = symbol.strip().upper()
-    if symbol.isdigit():
-        if len(symbol) <= 4:
-            return f"{symbol.zfill(4)}.HK"
+    if symbol.isdigit() and len(symbol) <= 4:
+        return f"{symbol.zfill(4)}.HK"
     return symbol
 
 def get_realtime_price(stock):
@@ -523,19 +525,24 @@ def fetch_stock_data(symbol: str):
     session = get_stock_session(symbol)
 
     if session in ["PRE", "REGULAR", "LUNCH_BREAK", "POST", "CLOSED"]:
+        open_col_idx = df.columns.get_loc("Open")
+        close_col_idx = df.columns.get_loc("Close")
+        high_col_idx = df.columns.get_loc("High")
+        low_col_idx = df.columns.get_loc("Low")
+
         real_open = get_realtime_open_price(stock, symbol)
         if real_open and real_open > 0:
-            df.iloc[-1, df.columns.get_loc("Open")] = real_open
+            df.iat[-1, open_col_idx] = real_open
         else:
-            curr_open = df.iloc[-1]["Open"]
+            curr_open = df.iat[-1, open_col_idx]
             if pd.isna(curr_open) or curr_open <= 0:
-                df.iloc[-1, df.columns.get_loc("Open")] = df.iloc[-1]["Close"]
+                df.iat[-1, open_col_idx] = df.iat[-1, close_col_idx]
 
         live_price = get_realtime_price(stock)
         if live_price and live_price > 0:
-            df.iloc[-1, df.columns.get_loc("Close")] = live_price
-            df.iloc[-1, df.columns.get_loc("High")] = max(df.iloc[-1]["High"], live_price)
-            df.iloc[-1, df.columns.get_loc("Low")] = min(df.iloc[-1]["Low"], live_price)
+            df.iat[-1, close_col_idx] = live_price
+            df.iat[-1, high_col_idx] = max(df.iat[-1, high_col_idx], live_price)
+            df.iat[-1, low_col_idx] = min(df.iat[-1, low_col_idx], live_price)
 
     return df, session
 
@@ -735,7 +742,7 @@ def calculate_rigorous_score(df: pd.DataFrame):
     return score, reasons, advice, shock_data
 
 # ----------------------------------------------------------------------
-# 13 大 AI 機器學習預估引擎
+# 13 大 AI 機器學習預估引擎 (性能優化版)
 # ----------------------------------------------------------------------
 def predict_prices_with_13_models(df: pd.DataFrame):
     try:
@@ -758,18 +765,19 @@ def predict_prices_with_13_models(df: pd.DataFrame):
 
         gpr_kernel = C(1.0) * RBF(1.0) + WhiteKernel()
 
+        # 優化預設模型參數，禁用 GPR 超參數二次搜尋以大幅提升快取速度
         models = {
             "BayesianRidge": BayesianRidge(),
             "DecisionTree": DecisionTreeRegressor(max_depth=3, random_state=42),
             "ElasticNet": ElasticNet(alpha=0.001, l1_ratio=0.5),
-            "ExtraTrees": ExtraTreesRegressor(n_estimators=30, max_depth=3, random_state=42),
-            "GBDT": GradientBoostingRegressor(n_estimators=30, max_depth=3, random_state=42),
-            "GaussianProcess": GaussianProcessRegressor(kernel=gpr_kernel, alpha=1e-2, random_state=42),
-            "HistGBDT": HistGradientBoostingRegressor(max_iter=30, max_depth=3, random_state=42),
-            "Huber": HuberRegressor(max_iter=1000),
+            "ExtraTrees": ExtraTreesRegressor(n_estimators=20, max_depth=3, random_state=42, n_jobs=-1),
+            "GBDT": GradientBoostingRegressor(n_estimators=20, max_depth=3, random_state=42),
+            "GaussianProcess": GaussianProcessRegressor(kernel=gpr_kernel, alpha=1e-2, random_state=42, n_restarts_optimizer=0),
+            "HistGBDT": HistGradientBoostingRegressor(max_iter=20, max_depth=3, random_state=42),
+            "Huber": HuberRegressor(max_iter=500),
             "Lasso": Lasso(alpha=0.001),
             "LinearRegression": LinearRegression(),
-            "RandomForest": RandomForestRegressor(n_estimators=30, max_depth=3, random_state=42),
+            "RandomForest": RandomForestRegressor(n_estimators=20, max_depth=3, random_state=42, n_jobs=-1),
             "Ridge": Ridge(alpha=2.0),
             "SVR": SVR(C=1.0, kernel='rbf')
         }
@@ -978,12 +986,10 @@ def process_single_stock(symbol: str):
         alert_history = GLOBAL_STATE.get("alert_history", [])
         time_str = datetime.now(ZoneInfo("Asia/Hong_Kong")).strftime("%m-%d %H:%M:%S")
         for sig in signals:
-            is_dup = False
-            if alert_history:
-                for past_alert in alert_history:
-                    if past_alert.get("symbol") == symbol and past_alert.get("signal") == sig:
-                        is_dup = True
-                        break
+            is_dup = any(
+                past_alert.get("symbol") == symbol and past_alert.get("signal") == sig
+                for past_alert in alert_history
+            )
             if not is_dup:
                 alert_history.insert(0, {
                     "id": f"{symbol}_{time_str}_{hash(sig)}",
@@ -1032,26 +1038,40 @@ def process_single_stock(symbol: str):
     }
 
 async def background_market_loop():
+    # 使用 Semaphore 控制併發數量，兼顧速度與防止 Rate Limit
+    sem = asyncio.Semaphore(3)
+
+    async def sem_process(symbol: str):
+        async with sem:
+            await asyncio.to_thread(process_single_stock, symbol)
+
     while True:
         watchlist = list(GLOBAL_STATE.get("watchlist", WATCHLIST))
-        for symbol in watchlist:
-            try:
-                await asyncio.to_thread(process_single_stock, symbol)
-                await asyncio.sleep(1.5)
-            except Exception as e:
-                print(f"全自動輪詢更新 {symbol} 失敗: {e}")
+        if watchlist:
+            tasks = [sem_process(s) for s in watchlist]
+            await asyncio.gather(*tasks, return_exceptions=True)
         
         await asyncio.sleep(20)
 
 # ----------------------------------------------------------------------
-# FastAPI 路由 API
+# FastAPI 路由 API 與 Lifespan 生命週期管理
 # ----------------------------------------------------------------------
 class StockReq(BaseModel):
     symbol: str
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(background_market_loop())
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 啟動時建立背景任務
+    bg_task = asyncio.create_task(background_market_loop())
+    yield
+    # 關閉時安全清理
+    bg_task.cancel()
+    try:
+        await bg_task
+    except asyncio.CancelledError:
+        pass
+
+app = FastAPI(title="AI Quant Trading Platform", lifespan=lifespan)
 
 @app.get("/api/state")
 def get_state():
