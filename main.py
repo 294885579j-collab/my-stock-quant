@@ -34,9 +34,12 @@ warnings.filterwarnings('ignore')
 STATE_FILE = "state_v2.json"
 WATCHLIST = ["3466.HK", "NVDA", "VOO", "RKLB"]
 
+# 優化 Session 請求頭以應對 Yahoo Finance 雲端 IP 限制
 YF_SESSION = requests.Session()
 YF_SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5"
 })
 
 app = FastAPI(title="AI Quant Trading Platform")
@@ -241,17 +244,36 @@ def bs_greeks_and_price(S: float, K: float, T: float, r: float, sigma: float, op
     }
 
 def calculate_options_recommendation(symbol: str, df: pd.DataFrame, score: int, shock_data: dict, events: list) -> dict:
-    """ 重構優化：量化期權風險與策略算式引擎 (包含 Sell Put 低價接股與長線增值邏輯) """
+    """ 優化後：具備雲端 IP 容錯與市場過濾機制的期權風險量化引擎 """
     
-    # 檢查股票是否支援期權 (並快取結果避免重複請求)
-    if symbol not in OPTIONS_CACHE:
+    symbol_upper = symbol.strip().upper()
+    
+    # 1. 港股與非美股市場直接判定無美式期權
+    if symbol_upper.endswith(".HK"):
+        return {
+            "strategy": "🚫 不能購買 (無美式期權市場)",
+            "action": "NONE",
+            "reason": f"系統檢測到 {symbol} 為港股標的，目前不支援標準美式期權交易。",
+            "strike_price": "N/A",
+            "exp_date": "N/A",
+            "take_profit_target": "N/A",
+            "greeks": {},
+            "risk_metrics": {},
+            "stress_test": []
+        }
+
+    # 2. 檢查美股是否支援期權 (並具備雲端伺服器 IP 攔截容錯機制)
+    if symbol_upper not in OPTIONS_CACHE:
         try:
             stock = yf.Ticker(symbol, session=YF_SESSION)
-            OPTIONS_CACHE[symbol] = bool(stock.options and len(stock.options) > 0)
+            # 嘗試取得期權鏈資訊
+            has_options = bool(stock.options and len(stock.options) > 0)
+            OPTIONS_CACHE[symbol_upper] = has_options
         except Exception:
-            OPTIONS_CACHE[symbol] = False
+            # 當 Render / Cloud IP 被 Yahoo 攔截時，美股標的自動回退預設允許，使用 BSM 進行理論擬合
+            OPTIONS_CACHE[symbol_upper] = True
 
-    if not OPTIONS_CACHE[symbol]:
+    if not OPTIONS_CACHE.get(symbol_upper, True):
         return {
             "strategy": "🚫 不能購買 (無期權市場)",
             "action": "NONE",
@@ -281,6 +303,7 @@ def calculate_options_recommendation(symbol: str, df: pd.DataFrame, score: int, 
     close_price = float(latest['Close'])
     atr = float(latest['ATR'])
     bb_lower = float(latest['BB_Lower'])
+    bb_upper = float(latest['BB_Upper'])
 
     log_returns = np.log(df['Close'] / df['Close'].shift(1)).dropna()
     hv_30d = float(log_returns.tail(30).std() * np.sqrt(252))
@@ -362,21 +385,11 @@ def calculate_options_recommendation(symbol: str, df: pd.DataFrame, score: int, 
             "stress_test": stress_test
         }
     else:
-        # ------------------------------------------------------------------
-        # 優化策略：Sell Put (現金擔保賣看跌 / 優惠價低位接股長線持股策略)
-        # ------------------------------------------------------------------
         strike = round(min(close_price - (1.5 * atr), bb_lower), 2)
         pct_otm = round((1 - strike / close_price) * 100, 1)
         
         bs_res = bs_greeks_and_price(close_price, strike, T, r, hv_30d, "put")
         put_price = bs_res["price"]
-        
-        # 1. 計算真實折讓接股成本價 (Effective Cost Basis)
-        cost_basis = round(strike - put_price, 2)
-        discount_pct = round((1 - cost_basis / close_price) * 100, 1)
-        
-        # 2. 計算長線持有目標價 (假設接股後期待 +20% 上漲空間)
-        lt_target_price = round(cost_basis * 1.20, 2)
         
         pop_pct = round((1.0 - norm.cdf(bs_res["d2"])) * 100, 1)
         var_95_stock = 1.645 * hv_30d * np.sqrt(T) * close_price
@@ -395,12 +408,12 @@ def calculate_options_recommendation(symbol: str, df: pd.DataFrame, score: int, 
             })
 
         return {
-            "strategy": "🛡️ 建議 Sell Put (現金擔保賣看跌 / 優惠價接股策略)",
+            "strategy": "🛡️ 建議 Sell Put (賣看跌期權/收取權利金)",
             "action": "SELL_PUT",
-            "reason": f"技術面處於中性盤整區間 ({score}分)。若到期未跌破行權價可穩賺權利金；若下跌被行權，扣除期權金後真實接股成本僅為 ${cost_basis} (較現價折讓 {discount_pct}%)，為長線值得入手的優質價格。",
+            "reason": f"技術面處於中性盤整區間 ({score}分)，適合透過 Sell Put 賺取時間價值衰減 (Theta decay)。",
             "strike_price": f"${strike} (OTM -{pct_otm}%)",
             "exp_date": f"{exp_date} ({days_to_exp} 天 DTE)",
-            "take_profit_target": f"期權獲利 50%~75% 權利金提前買回平倉；若被行權接股，則轉為長線持有，目標價看至 ${lt_target_price} (預期離場獲利 +20%)",
+            "take_profit_target": "當獲得最大權利金收益之 50% ~ 75% 時提前買回平倉 (Buy to Close)",
             "greeks": {
                 "hv_30d": f"{hv_30d*100:.1f}%",
                 "est_premium": f"${put_price:.2f}",
@@ -410,12 +423,10 @@ def calculate_options_recommendation(symbol: str, df: pd.DataFrame, score: int, 
                 "vega": f"${bs_res['vega']:.3f}/1% IV"
             },
             "risk_metrics": {
-                "pop": f"{pop_pct}% (到期不履約/純賺權利金勝率)",
+                "pop": f"{pop_pct}% (到期不履約/獲利勝率)",
                 "max_gain": f"${put_price:.2f} / 股 (${put_price*100:.0f} / 張)",
-                "effective_cost": f"${cost_basis} (行權真實接股成本 / 折讓 {discount_pct}%)",
-                "lt_target": f"${lt_target_price} (接股後長線獲利目標價 +20%)",
                 "var_95": f"${var_95_stock:.2f} (正股 95% 波動風險值)",
-                "breakeven": f"${cost_basis} (損益平衡點)"
+                "breakeven": f"${strike - put_price:.2f} (損益平衡點)"
             },
             "stress_test": stress_test
         }
@@ -1102,7 +1113,7 @@ def trigger_test_alert():
     return {"status": "ok", "alert": test_alert}
 
 # ----------------------------------------------------------------------
-# 網頁控制台前端 (全面支援 BSM Greeks、接股成本計算與壓力測試 UI)
+# 網頁控制台前端 (已全面支援 BSM Greeks 與壓力測試 UI)
 # ----------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -1135,7 +1146,7 @@ def index():
                     全自動即時連線中
                 </span>
             </div>
-            <p class="text-xs text-gray-400 mt-1">13 大 AI 機器學習模型全自動持續更新 + BSM 期權風險量化引擎 (Greeks / PoP / Cost Basis / Stress Test)</p>
+            <p class="text-xs text-gray-400 mt-1">13 大 AI 機器學習模型全自動持續更新 + BSM 期權風險量化引擎 (Greeks / PoP / Stress Test)</p>
         </div>
         <div class="flex items-center gap-2">
             <input type="text" id="stockInput" placeholder="輸入代碼 (例: 3466.HK, NVDA)" 
@@ -1390,8 +1401,6 @@ def index():
                         riskMetricsHtml = `
                             <div class="mt-2 pt-2 border-t border-purple-900/40 grid grid-cols-1 sm:grid-cols-2 gap-1 text-[11px]">
                                 ${opt.risk_metrics.pop ? `<div>• 到期勝率 (PoP): <span class="text-emerald-400 font-bold">${opt.risk_metrics.pop}</span></div>` : ''}
-                                ${opt.risk_metrics.effective_cost ? `<div>• 實際接股成本: <span class="text-cyan-300 font-bold">${opt.risk_metrics.effective_cost}</span></div>` : ''}
-                                ${opt.risk_metrics.lt_target ? `<div>• 接股後長線目標: <span class="text-emerald-400 font-bold">${opt.risk_metrics.lt_target}</span></div>` : ''}
                                 ${opt.risk_metrics.max_loss ? `<div>• 最大風險損失: <span class="text-rose-400 font-bold">${opt.risk_metrics.max_loss}</span></div>` : ''}
                                 ${opt.risk_metrics.max_gain ? `<div>• 最大可能收益: <span class="text-emerald-400 font-bold">${opt.risk_metrics.max_gain}</span></div>` : ''}
                                 ${opt.risk_metrics.var_95 ? `<div>• 正股 95% VaR: <span class="text-amber-400 font-bold">${opt.risk_metrics.var_95}</span></div>` : ''}
@@ -1441,7 +1450,7 @@ def index():
                                 <div class="font-bold text-sm text-purple-300">${opt.strategy}</div>
                                 <div>• 建議行使價: <span class="text-white font-bold">${opt.strike_price || '無'}</span></div>
                                 <div>• 建議到期日: <span class="text-white font-bold">${opt.exp_date || '無'}</span></div>
-                                <div class="text-amber-300">• 離場/獲利目標: ${opt.take_profit_target}</div>
+                                <div class="text-amber-300">• 提前平倉目標: ${opt.take_profit_target}</div>
                                 <div class="text-[11px] text-gray-400 mt-1">• 量化說明: ${opt.reason}</div>
                                 ${greeksHtml}
                                 ${riskMetricsHtml}
