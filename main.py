@@ -37,14 +37,14 @@ WATCHLIST = ["3466.HK", "NVDA", "VOO", "RKLB"]
 # 優化 Session 請求頭以應對 Yahoo Finance 雲端 IP 限制
 YF_SESSION = requests.Session()
 YF_SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5"
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache"
 })
 
 app = FastAPI(title="AI Quant Trading Platform")
 
-# 期權狀態快取 (避免頻繁請求 API 導致 Rate Limit)
 OPTIONS_CACHE = {}
 
 # ----------------------------------------------------------------------
@@ -155,7 +155,8 @@ def get_macro_events(start_date: datetime.date, end_date: datetime.date) -> List
 
 def fetch_stock_events(symbol: str) -> List[Dict[str, Any]]:
     symbol = symbol.strip().upper()
-    now_tz = datetime.now(ZoneInfo("Asia/Hong_Kong")).date()
+    tz_str = "Asia/Hong_Kong" if symbol.endswith(".HK") else "America/New_York"
+    now_tz = datetime.now(ZoneInfo(tz_str)).date()
     end_date = now_tz + timedelta(days=30)
     
     events = []
@@ -244,11 +245,8 @@ def bs_greeks_and_price(S: float, K: float, T: float, r: float, sigma: float, op
     }
 
 def calculate_options_recommendation(symbol: str, df: pd.DataFrame, score: int, shock_data: dict, events: list) -> dict:
-    """ 優化後：具備雲端 IP 容錯與市場過濾機制的期權風險量化引擎 """
-    
     symbol_upper = symbol.strip().upper()
     
-    # 1. 港股與非美股市場直接判定無美式期權
     if symbol_upper.endswith(".HK"):
         return {
             "strategy": "🚫 不能購買 (無美式期權市場)",
@@ -262,15 +260,12 @@ def calculate_options_recommendation(symbol: str, df: pd.DataFrame, score: int, 
             "stress_test": []
         }
 
-    # 2. 檢查美股是否支援期權 (並具備雲端伺服器 IP 攔截容錯機制)
     if symbol_upper not in OPTIONS_CACHE:
         try:
             stock = yf.Ticker(symbol, session=YF_SESSION)
-            # 嘗試取得期權鏈資訊
             has_options = bool(stock.options and len(stock.options) > 0)
             OPTIONS_CACHE[symbol_upper] = has_options
         except Exception:
-            # 當 Render / Cloud IP 被 Yahoo 攔截時，美股標的自動回退預設允許，使用 BSM 進行理論擬合
             OPTIONS_CACHE[symbol_upper] = True
 
     if not OPTIONS_CACHE.get(symbol_upper, True):
@@ -303,7 +298,6 @@ def calculate_options_recommendation(symbol: str, df: pd.DataFrame, score: int, 
     close_price = float(latest['Close'])
     atr = float(latest['ATR'])
     bb_lower = float(latest['BB_Lower'])
-    bb_upper = float(latest['BB_Upper'])
 
     log_returns = np.log(df['Close'] / df['Close'].shift(1)).dropna()
     hv_30d = float(log_returns.tail(30).std() * np.sqrt(252))
@@ -963,7 +957,6 @@ def process_single_stock(symbol: str):
     
     upcoming_events = fetch_stock_events(symbol)
 
-    # 計算升級版的期權量化風險建議數據
     options_rec = calculate_options_recommendation(
         symbol=symbol,
         df=df,
